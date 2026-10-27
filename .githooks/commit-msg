@@ -1,0 +1,2 @@
+#!/bin/sh
+sed -i '/^Co-[Aa]uthored-[Bb]y: Claude/d; /^Claude-Session:/d; /Generated with \[Claude Code\]/d' "$1"
