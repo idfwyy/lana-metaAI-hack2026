@@ -235,13 +235,37 @@ async def test_yes_match_records_concession(monkeypatch: pytest.MonkeyPatch) -> 
     assert concession.evidence.call_id == "c1"
 
 
+PAY_IN_FULL = MATCH.model_copy(
+    update={"kind": MoveKind.PAY_IN_FULL, "cited_clinic": None, "cited_amount": None}
+)
+
+
 async def test_pay_in_full_amount_must_be_said(monkeypatch: pytest.MonkeyPatch) -> None:
-    move = MATCH.model_copy(update={"kind": MoveKind.PAY_IN_FULL, "cited_clinic": None, "cited_amount": None})
     monkeypatch.setattr(
-        negotiator, "call_json", FakeJson(_reading(Verdict.YES, amount_off=240, evidence="yes, 5% off"))
+        negotiator, "call_json", FakeJson(_reading(Verdict.YES, amount_off=240, evidence="we can do a discount"))
     )
 
-    assert await record_reply(move, "Yes, 5% off if you pay in full.", 1.0, "c1") is None
+    assert await record_reply(PAY_IN_FULL, "Yes, we can do a discount for that.", 1.0, "c1") is None
+
+
+@pytest.mark.parametrize("current, expected", [(4200, 210), (5050, 253)])  # 252.5 rounds up
+async def test_pay_in_full_percent_is_computed_in_python(
+    monkeypatch: pytest.MonkeyPatch, current: int, expected: int
+) -> None:
+    move = PAY_IN_FULL.model_copy(update={"current_all_in": current})
+    # The model's own amount_off is not in the line, so it is ignored.
+    monkeypatch.setattr(
+        negotiator,
+        "call_json",
+        FakeJson(_reading(Verdict.YES, amount_off=999, evidence="WE CAN DO 5 OFF")),
+    )
+
+    concession = await record_reply(move, "Sure, we can do 5% off if you pay in full.", 4.0, "c1")
+
+    assert concession.amount == expected
+    assert concession.evidence.value == expected
+    assert concession.evidence.evidence == "we can do 5% off"
+    assert concession.label == "Pay-in-full discount"
 
 
 # ---------- the whole negotiation ----------

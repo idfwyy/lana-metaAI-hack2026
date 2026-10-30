@@ -191,7 +191,8 @@ class ClinicSimulator:
         messages = [{"role": "system", "content": system}, *self._history]
         stream = stream_chat(messages, settings.model_fast, reasoning=settings.call_reasoning)
         chunks = [c async for c in stream]
-        return "".join(chunks).strip()
+        # No em dashes in on-screen text, same cleanup as Lana's lines.
+        return re.sub(r"\s*—\s*", ", ", "".join(chunks)).strip()
 
     def _price_problem(self, reply: str) -> str | None:
         """Why the reply fails the price check, or None if it passes."""

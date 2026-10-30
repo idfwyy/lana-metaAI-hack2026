@@ -6,6 +6,7 @@ stored on its Move, and a concession only counts when the clinic's own words bac
 
 import inspect
 import logging
+import math
 import re
 from datetime import datetime
 from enum import StrEnum
@@ -64,6 +65,9 @@ CLOSING_LINE = (
     "Thank you so much for working with me on this, I'll share it with the patient "
     "and we'll call back to book."
 )
+
+# A percent discount the clinic said ("5% off", "3 percent").
+_PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s?(?:%|percent\b)", re.IGNORECASE)
 
 # A clinic-like name ("Bright Smiles Orthodontics"), to catch names the model made up.
 _CLINIC_NAME_RE = re.compile(
@@ -291,6 +295,9 @@ def concession_from(
             amount = reading.amount_off
         elif reading.new_all_in in stated:
             amount = current - reading.new_all_in
+        elif percent := _PERCENT_RE.search(clinic_line):
+            # Whole dollars, halves rounded up (Python's round() would round 252.5 down).
+            amount = math.floor(current * float(percent[1]) / 100 + 0.5)
         else:
             amount = 0  # a discount with no amount the clinic actually said
     else:

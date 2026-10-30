@@ -87,6 +87,16 @@ async def test_fees_and_monthly_below_floor_are_allowed(chat: FakeChat) -> None:
     assert len(chat.calls) == 1
 
 
+async def test_em_dashes_are_cleaned(chat: FakeChat) -> None:
+    chat.replies = ["Let me check with my manager — yes, we can match $4,200—all in."]
+    sim = _parkway()
+
+    reply = await sim.next_line("Could you match $4,200 all in?")
+
+    assert reply == "Let me check with my manager, yes, we can match $4,200, all in."
+    assert sim.history[-1] == {"role": "assistant", "content": reply}
+
+
 async def test_history_kept_across_turns(chat: FakeChat) -> None:
     chat.replies = ["Treatment is $4,800.", "Yes, the consult is free."]
     sim = _parkway()
