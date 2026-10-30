@@ -2,6 +2,16 @@
 
 Newest first.
 
+## 2026-10-29: reasoning_effort="minimal" for live call turns (CALL_REASONING)
+
+Source: Meta Model API docs, Reasoning guide, https://dev.meta.ai/docs/reasoning (re-checked today; matches the 2026-10-28 entry below).
+
+- Chat Completions takes a top-level `reasoning_effort`. Reasoning cannot be turned off: `none` returns HTTP 400 on Muse Spark and Muse Wonder. The lowest level is `minimal`, "Shortest reasoning pass."
+- `meta_llm.stream_chat` and `call_json` take an optional `reasoning` argument. When it is `None`, the parameter is left out and the model picks its own level, which is how every call worked before.
+- New setting `CALL_REASONING` (default `minimal`) sets the level for live call turns. Demo receptionist turns (`clinics/simulator.py`) use it now.
+- `meta_llm` now logs `usage.completion_tokens_details.reasoning_tokens`.
+- Measured on `muse-spark-1.3` receptionist turns at `minimal`: 31 to 337 reasoning tokens per turn (most under 65), 0.9 to 3.1 s. A five-word ping without the setting used about 830 completion tokens. The price-match turn reasoned longest.
+
 ## 2026-10-28: Hidden reasoning tokens and the reasoning_effort setting
 
 Observed: a five-word `agent ping` reply used about 850 completion tokens on `muse-spark-1.3` and 280 on `muse-wonder-1.0` (prompt was 14 tokens). Latency was 4.2 s and 3.4 s. This is likely hidden reasoning, which costs money and adds latency on every live call turn.

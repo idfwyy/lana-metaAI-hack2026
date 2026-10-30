@@ -95,31 +95,48 @@ def _strip_fences(text: str) -> str:
     return text.strip()
 
 
+def _reasoning_kwargs(reasoning: str | None) -> dict:
+    """`reasoning_effort` only when set; left out, the model picks its own level.
+
+    Muse Spark and Muse Wonder reject "none"; "minimal" is the lowest (see docs/decisions.md).
+    """
+    return {"reasoning_effort": reasoning} if reasoning else {}
+
+
 def _log_call(model: str, started: float, usage: object | None) -> None:
     latency_ms = (time.perf_counter() - started) * 1000
     if usage is not None:
+        details = getattr(usage, "completion_tokens_details", None)
         log.info(
-            "meta_llm model=%s latency_ms=%.0f prompt_tokens=%s completion_tokens=%s",
+            "meta_llm model=%s latency_ms=%.0f prompt_tokens=%s completion_tokens=%s "
+            "reasoning_tokens=%s",
             model,
             latency_ms,
             getattr(usage, "prompt_tokens", None),
             getattr(usage, "completion_tokens", None),
+            getattr(details, "reasoning_tokens", None),
         )
     else:
         log.info("meta_llm model=%s latency_ms=%.0f usage=not_returned", model, latency_ms)
 
 
-async def _complete(prompt: str, model: str, images: list[bytes] | None) -> str:
+async def _complete(
+    prompt: str, model: str, images: list[bytes] | None, reasoning: str | None
+) -> str:
     started = time.perf_counter()
     response = await get_client().chat.completions.create(
-        model=model, messages=[_user_message(prompt, images)]
+        model=model, messages=[_user_message(prompt, images)], **_reasoning_kwargs(reasoning)
     )
     _log_call(model, started, response.usage)
     return response.choices[0].message.content or ""
 
 
 async def call_json[T: BaseModel](
-    prompt: str, schema: type[T], model: str, images: list[bytes] | None = None
+    prompt: str,
+    schema: type[T],
+    model: str,
+    images: list[bytes] | None = None,
+    reasoning: str | None = None,
 ) -> T:
     """Ask for JSON matching `schema` and return it validated. Retries once with the error."""
     if not model:
@@ -128,14 +145,14 @@ async def call_json[T: BaseModel](
         schema=json.dumps(schema.model_json_schema(), indent=2)
     )
 
-    raw = await _complete(full_prompt, model, images)
+    raw = await _complete(full_prompt, model, images, reasoning)
     try:
         return schema.model_validate_json(_strip_fences(raw))
     except ValidationError as err:
         log.info("meta_llm model=%s invalid JSON, retrying once", model)
         retry_prompt = full_prompt + RETRY_INSTRUCTIONS.format(error=err)
 
-    raw = await _complete(retry_prompt, model, images)
+    raw = await _complete(retry_prompt, model, images, reasoning)
     try:
         return schema.model_validate_json(_strip_fences(raw))
     except ValidationError as err:
@@ -144,14 +161,16 @@ async def call_json[T: BaseModel](
         ) from err
 
 
-async def stream_chat(messages: list[dict], model: str) -> AsyncIterator[str]:
+async def stream_chat(
+    messages: list[dict], model: str, reasoning: str | None = None
+) -> AsyncIterator[str]:
     """Yield text chunks as they arrive, so text-to-speech can start early."""
     if not model:
         raise ValueError("model is empty; set MODEL_FAST / MODEL_SMART in .env")
     started = time.perf_counter()
     usage = None
     stream = await get_client().chat.completions.create(
-        model=model, messages=messages, stream=True
+        model=model, messages=messages, stream=True, **_reasoning_kwargs(reasoning)
     )
     async for chunk in stream:
         if chunk.usage is not None:

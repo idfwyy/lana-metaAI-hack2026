@@ -2,6 +2,7 @@
 
 from functools import cached_property, lru_cache
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
@@ -52,6 +53,8 @@ class Settings(BaseSettings):
     model_smart: str = ""
     model_stt: str = ""
     stt_realtime_url: str = ""
+    # reasoning_effort for live call turns. "none" is rejected by Muse models; "minimal" is lowest.
+    call_reasoning: Literal["minimal", "low", "medium", "high", "xhigh", "max"] = "minimal"
 
     # Voice
     elevenlabs_api_key: SecretStr = SecretStr("")

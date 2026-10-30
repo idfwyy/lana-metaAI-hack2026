@@ -7,7 +7,9 @@ import time
 import typer
 from rich.console import Console
 
+from app.clinics.simulator import ClinicSimulator
 from app.config import get_settings
+from app.data.loader import load_demo_clinics
 from app.integrations.meta_llm import stream_chat
 
 app = typer.Typer(no_args_is_help=True)
@@ -46,6 +48,38 @@ def ping() -> None:
     """Send a short prompt to MODEL_FAST and MODEL_SMART and print each reply and its latency."""
     if not asyncio.run(_ping_all()):
         raise typer.Exit(code=1)
+
+
+async def _clinic_chat(sim: ClinicSimulator) -> None:
+    console.print(f"Talking to {sim.clinic.name}. Type as Lana; 'quit' exits.")
+    while True:
+        try:
+            line = console.input("[bold]LANA>[/bold] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if line.lower() == "quit":
+            return
+        if not line:
+            continue
+        started = time.perf_counter()
+        try:
+            reply = await sim.next_line(line)
+        except Exception as err:
+            console.print(f"[red]{type(err).__name__}: {err}[/red]")
+            continue
+        seconds = time.perf_counter() - started
+        hold = " (on hold)" if sim.on_hold else ""
+        console.print(f"[magenta]CLINIC>[/magenta] {reply}  [dim]{seconds:.2f}s{hold}[/dim]")
+
+
+@app.command("clinic-chat")
+def clinic_chat(clinic: str = typer.Option(..., help="Demo clinic id, e.g. parkway")) -> None:
+    """Chat with a demo clinic receptionist as Lana, one typed line at a time."""
+    clinics = {c.id: (c, sheet) for c, sheet in load_demo_clinics()}
+    if clinic not in clinics:
+        console.print(f"[red]Unknown clinic '{clinic}'. Choose from: {', '.join(clinics)}[/red]")
+        raise typer.Exit(code=1)
+    asyncio.run(_clinic_chat(ClinicSimulator(*clinics[clinic])))
 
 
 if __name__ == "__main__":
