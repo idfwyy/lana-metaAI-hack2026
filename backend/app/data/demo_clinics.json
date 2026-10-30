@@ -1,0 +1,125 @@
+[
+  {
+    "clinic": {
+      "id": "parkway",
+      "name": "Parkway Orthodontics",
+      "distance_mi": 3.1,
+      "rating": 4.9,
+      "review_count": 412,
+      "hours": "Mon-Thu 8am-7pm, Fri 8am-3pm",
+      "review_summary": "Patients love the evening appointments, the warm front desk and how clearly the doctor explains treatment. A few say it costs more than nearby offices.",
+      "phone": "555-0101",
+      "is_demo": true,
+      "voice_id": "VOICE_CLINIC_1"
+    },
+    "price_sheet": {
+      "list_price": 4800,
+      "records_fee": 250,
+      "consult_fee": 0,
+      "monthly": 180,
+      "down_payment": 1000,
+      "floor_price": 3990,
+      "will_price_match": true,
+      "will_waive_records": true,
+      "pay_in_full_discount_pct": 5,
+      "will_add_retainers": true,
+      "open_slots": [
+        {
+          "day_offset": 4,
+          "time": "17:30"
+        },
+        {
+          "day_offset": 6,
+          "time": "18:00"
+        },
+        {
+          "day_offset": 7,
+          "time": "08:30"
+        }
+      ],
+      "personality": "Friendly and chatty, but always checks with a manager before matching a price or giving a discount."
+    }
+  },
+  {
+    "clinic": {
+      "id": "sunrise",
+      "name": "Sunrise Orthodontic Studio",
+      "distance_mi": 5.4,
+      "rating": 4.6,
+      "review_count": 238,
+      "hours": "Mon-Fri 7am-4pm",
+      "review_summary": "Known for low, upfront prices and quick visits. Some reviewers mention the office feels rushed and there are no after-work appointments.",
+      "phone": "555-0102",
+      "is_demo": true,
+      "voice_id": "VOICE_CLINIC_2"
+    },
+    "price_sheet": {
+      "list_price": 4200,
+      "records_fee": 0,
+      "consult_fee": 0,
+      "monthly": 175,
+      "down_payment": 500,
+      "floor_price": 4050,
+      "will_price_match": false,
+      "will_waive_records": false,
+      "pay_in_full_discount_pct": 3,
+      "will_add_retainers": false,
+      "open_slots": [
+        {
+          "day_offset": 1,
+          "time": "07:30"
+        },
+        {
+          "day_offset": 5,
+          "time": "10:00"
+        },
+        {
+          "day_offset": 6,
+          "time": "14:00"
+        }
+      ],
+      "personality": "Brisk and busy, gives short answers, and wants to wrap up the call quickly."
+    }
+  },
+  {
+    "clinic": {
+      "id": "lakeside",
+      "name": "Lakeside Family Orthodontics",
+      "distance_mi": 8.0,
+      "rating": 4.4,
+      "review_count": 156,
+      "hours": "Mon-Fri 9am-5pm, Sat 9am-1pm",
+      "review_summary": "Families like the Saturday hours and the patient staff. Several reviews say the office is firm on pricing and rarely offers deals.",
+      "phone": "555-0103",
+      "is_demo": true,
+      "voice_id": "VOICE_CLINIC_3"
+    },
+    "price_sheet": {
+      "list_price": 4500,
+      "records_fee": 150,
+      "consult_fee": 0,
+      "monthly": 190,
+      "down_payment": 800,
+      "floor_price": 4300,
+      "will_price_match": false,
+      "will_waive_records": false,
+      "pay_in_full_discount_pct": 3,
+      "will_add_retainers": false,
+      "open_slots": [
+        {
+          "weekday": "saturday",
+          "time": "09:30"
+        },
+        {
+          "day_offset": 5,
+          "time": "15:00"
+        },
+        {
+          "weekday": "saturday",
+          "time": "11:00"
+        }
+      ],
+      "personality": "Polite and patient, but says no to most discounts and sticks to the listed price."
+    }
+  }
+]
