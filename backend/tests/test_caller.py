@@ -10,11 +10,13 @@ from app.agent.caller import (
     CLOSING_LINE,
     DISCLOSURE,
     FALLBACK_QUESTIONS,
+    HOLD_REQUEST,
     MAX_LANA_TURNS,
     WORDS_PER_SECOND,
     Caller,
 )
 from app.agent.extractor import CHECKLIST_ORDER
+from app.clinics.simulator import is_hold_request
 from app.config import get_settings
 from app.data.loader import get_public_clinics
 from app.schemas.checklist import ClinicChecklist, SourcedAnswer
@@ -243,3 +245,47 @@ async def test_em_dashes_and_labels_are_cleaned(chat, no_extraction) -> None:
     await Caller(_clinic(), PREFS, on_line).run(FakeReceptionist())
 
     assert lines[0][1].endswith("Great, is there a records fee?")
+
+
+async def test_end_with_hold_asks_to_hold_and_keeps_reply(chat, no_extraction) -> None:
+    lines, on_line = _recorder()
+    receptionist = FakeReceptionist("Sure, I'll hold.")
+
+    result = await Caller(_clinic(), PREFS, on_line, end_with="hold").run(receptionist)
+
+    assert _lana(lines)[-1] == HOLD_REQUEST
+    assert CLOSING_LINE not in _lana(lines)
+    assert receptionist.heard[-1] == HOLD_REQUEST
+    assert result.transcript.lines[-1].speaker == Speaker.CLINIC
+    assert result.transcript.lines[-1].text == "Sure, I'll hold."
+
+
+def test_hold_request_is_heard_as_a_hold() -> None:
+    assert is_hold_request(HOLD_REQUEST)
+
+
+async def test_default_ends_with_closing_line(chat, no_extraction) -> None:
+    lines, on_line = _recorder()
+
+    await Caller(_clinic(), PREFS, on_line).run(FakeReceptionist())
+
+    assert _lana(lines)[-1] == CLOSING_LINE
+    assert HOLD_REQUEST not in _lana(lines)
+
+
+async def test_on_checklist_called_only_on_change(chat, monkeypatch: pytest.MonkeyPatch) -> None:
+    filled = ClinicChecklist(total_price=_answer(4200))
+    results = [filled, filled, FULL]
+
+    async def scripted(checklist, transcript):
+        return results.pop(0) if results else checklist
+
+    monkeypatch.setattr(caller, "update_checklist", scripted)
+    seen: list[ClinicChecklist] = []
+
+    async def on_checklist(checklist):
+        seen.append(checklist)
+
+    await Caller(_clinic(), PREFS, lambda *a: None, on_checklist=on_checklist).run(FakeReceptionist())
+
+    assert seen == [filled, FULL]

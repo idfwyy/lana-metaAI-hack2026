@@ -331,10 +331,10 @@ async def record_reply(
 
 
 class _Call:
-    def __init__(self, receptionist: Receptionist, on_line: OnLine) -> None:
+    def __init__(self, receptionist: Receptionist, on_line: OnLine, start_t: float = 0.0) -> None:
         self.receptionist = receptionist
         self.on_line = on_line
-        self.clock = 0.0
+        self.clock = start_t
 
     async def say(self, speaker: Speaker, text: str) -> float:
         t = round(self.clock, 1)
@@ -357,9 +357,15 @@ async def negotiate(
     on_line: OnLine,
     call_id: str,
     opening: bool = True,
+    opening_line: str | None = None,
+    start_t: float = 0.0,
 ) -> NegotiationResult:
-    """Ask each move once (at most 4 asks). A no ends that move; the next one is tried."""
-    call = _Call(receptionist, on_line)
+    """Ask each move once (at most 4 asks). A no ends that move; the next one is tried.
+
+    `opening_line` (e.g. "Thanks for holding.") goes in front of Lana's first line, after the
+    disclosure. `start_t` continues a call's clock, so evidence seconds match that call.
+    """
+    call = _Call(receptionist, on_line, start_t)
     first = target_quote.all_in_price or 0
     current = first
     concessions: list[Concession] = []
@@ -374,6 +380,8 @@ async def negotiate(
             continue  # the matched price was already all-in
         move = planned.model_copy(update={"current_all_in": current})
         line = await phrase_move(move)
+        if asks == 0 and opening_line:
+            line = f"{opening_line} {line}"
         if opening and asks == 0:
             line = f"{DISCLOSURE.format(agent_name=get_settings().agent_name)} {line}"
         asks += 1
@@ -400,7 +408,8 @@ async def negotiate(
         current -= concession.amount
         matched = matched or move.kind == MoveKind.MATCH
 
-    await call.say(Speaker.AGENT, CLOSING_LINE)
+    closing = f"{opening_line} {CLOSING_LINE}" if asks == 0 and opening_line else CLOSING_LINE
+    await call.say(Speaker.AGENT, closing)
     return NegotiationResult(
         clinic_id=target_quote.clinic_id,
         first_all_in=first,

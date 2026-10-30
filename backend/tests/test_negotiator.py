@@ -350,3 +350,58 @@ async def test_second_pending_counts_as_no(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_reading_schema_defaults() -> None:
     assert ReplyReading(verdict=Verdict.NO).evidence == ""
+
+
+async def test_start_t_continues_the_call_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def phrase(move):
+        return move.template()
+
+    monkeypatch.setattr(negotiator, "phrase_move", phrase)
+    monkeypatch.setattr(
+        negotiator,
+        "call_json",
+        FakeJson(_reading(Verdict.YES, new_all_in=4200, evidence="we can match $4,200")),
+    )
+    receptionist = FakeReceptionist("Good news, we can match $4,200.")
+    lines: list[tuple[Speaker, str, float]] = []
+
+    result = await negotiate(
+        _quotes()["parkway"],
+        _moves()[:1],
+        receptionist,
+        lambda s, t, ts: lines.append((s, t, ts)),
+        "c1",
+        opening=False,
+        start_t=42.0,
+    )
+
+    assert lines[0][2] == 42.0
+    clinic_t = lines[1][2]
+    assert clinic_t > 42.0
+    assert result.concessions[0].evidence.t_seconds == clinic_t
+
+
+async def test_opening_line_prepended_once_without_disclosure(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def phrase(move):
+        return move.template()
+
+    monkeypatch.setattr(negotiator, "phrase_move", phrase)
+    monkeypatch.setattr(negotiator, "call_json", FakeJson(*[_reading(Verdict.NO)] * 4))
+    receptionist = FakeReceptionist(*["No, sorry."] * 4)
+    lines: list[tuple[Speaker, str, float]] = []
+
+    await negotiate(
+        _quotes()["parkway"],
+        _moves(),
+        receptionist,
+        lambda s, t, ts: lines.append((s, t, ts)),
+        "c1",
+        opening=False,
+        opening_line="Thanks for holding.",
+    )
+
+    lana = [text for speaker, text, _ in lines if speaker == Speaker.AGENT]
+    assert lana[0] == f"Thanks for holding. {_moves()[0].template()}"
+    assert receptionist.heard[0] == lana[0]
+    assert sum("Thanks for holding." in line for line in lana) == 1
+    assert not any("AI assistant" in line for line in lana)

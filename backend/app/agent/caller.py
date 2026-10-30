@@ -12,7 +12,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from app.agent.extractor import CHECKLIST_ORDER, Transcript, TranscriptLine, update_checklist
 from app.config import get_settings
@@ -29,6 +29,8 @@ PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "caller.md"
 
 DISCLOSURE = "Hi, this is {agent_name}, an AI assistant calling for a patient, and this call is recorded."
 CLOSING_LINE = "That's everything I needed, thank you so much for your help. Have a great day!"
+# Said instead of CLOSING_LINE when the orchestrator wants to come back to this call.
+HOLD_REQUEST = "Could you hold for just a moment? I want to check one thing for the patient."
 
 # Said instead of the model's line when it is empty or names another clinic.
 FALLBACK_QUESTIONS = {
@@ -46,6 +48,7 @@ MAX_ASKS = 2  # after this many asks a field is left as not confirmed
 WORDS_PER_SECOND = 2.6  # text mode speaking pace
 
 OnLine = Callable[[Speaker, str, float], None | Awaitable[None]]
+OnChecklist = Callable[[ClinicChecklist], None | Awaitable[None]]
 
 
 class Receptionist(Protocol):
@@ -105,10 +108,14 @@ class Caller:
         preferences: Preferences,
         on_line: OnLine,
         call_id: str | None = None,
+        end_with: Literal["hold", "close"] = "close",
+        on_checklist: OnChecklist | None = None,
     ) -> None:
         self.clinic = clinic
         self.preferences = preferences
         self.on_line = on_line
+        self.end_with = end_with
+        self.on_checklist = on_checklist
         self.checklist = ClinicChecklist()
         self.transcript = Transcript(call_id=call_id or uuid.uuid4().hex[:12], clinic_id=clinic.id)
         self._asks = dict.fromkeys(CHECKLIST_ORDER, 0)
@@ -123,7 +130,11 @@ class Caller:
         while True:
             fields = self._fields_to_ask()
             if not fields or self._lana_turns >= MAX_LANA_TURNS - 1:
-                await self._say(Speaker.AGENT, CLOSING_LINE)
+                if self.end_with == "hold":
+                    await self._say(Speaker.AGENT, HOLD_REQUEST)
+                    await self._say(Speaker.CLINIC, await receptionist.next_line(HOLD_REQUEST))
+                else:
+                    await self._say(Speaker.AGENT, CLOSING_LINE)
                 break
             line = await self._question(fields)
             if self._lana_turns == 0:
@@ -187,6 +198,13 @@ class Caller:
     async def _extract(self) -> None:
         """Update the checklist; a failed extraction keeps what we had so the call goes on."""
         try:
-            self.checklist = await update_checklist(self.checklist, self.transcript)
+            updated = await update_checklist(self.checklist, self.transcript)
         except Exception as err:
             log.warning("caller call=%s extraction failed: %s", self.transcript.call_id, err)
+            return
+        changed = updated != self.checklist
+        self.checklist = updated
+        if changed and self.on_checklist is not None:
+            result = self.on_checklist(updated)
+            if inspect.isawaitable(result):
+                await result
