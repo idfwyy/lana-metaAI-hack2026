@@ -1,0 +1,81 @@
+{
+  "call_id": "fixture-sunrise-1",
+  "clinic_id": "sunrise",
+  "lines": [
+    {
+      "speaker": "agent",
+      "text": "Hi, this is Lana, an AI assistant calling for a patient, and this call is recorded. How much is comprehensive braces treatment at your office?",
+      "t_seconds": 0.0
+    },
+    {
+      "speaker": "clinic",
+      "text": "Comprehensive braces are $4,200 total.",
+      "t_seconds": 9.6
+    },
+    {
+      "speaker": "agent",
+      "text": "Is there a separate records fee for x-rays and scans?",
+      "t_seconds": 11.5
+    },
+    {
+      "speaker": "clinic",
+      "text": "No, there's no records fee, x-rays and scans are included.",
+      "t_seconds": 15.4
+    },
+    {
+      "speaker": "agent",
+      "text": "Great, and what else does the $4,200 cover?",
+      "t_seconds": 19.2
+    },
+    {
+      "speaker": "clinic",
+      "text": "It covers the braces, all adjustment visits, x-rays and scans, and one set of retainers.",
+      "t_seconds": 22.3
+    },
+    {
+      "speaker": "agent",
+      "text": "If the patient pays monthly, how much would each payment be?",
+      "t_seconds": 28.1
+    },
+    {
+      "speaker": "clinic",
+      "text": "It's $175 a month.",
+      "t_seconds": 32.3
+    },
+    {
+      "speaker": "agent",
+      "text": "And how much is the down payment for that plan?",
+      "t_seconds": 33.8
+    },
+    {
+      "speaker": "clinic",
+      "text": "$500 down.",
+      "t_seconds": 37.7
+    },
+    {
+      "speaker": "agent",
+      "text": "When is your next available consult appointment?",
+      "t_seconds": 38.5
+    },
+    {
+      "speaker": "clinic",
+      "text": "We have Friday, October 30 at 7:30 AM or Tuesday, November 3 at 10:00 AM. Want me to book one?",
+      "t_seconds": 41.2
+    },
+    {
+      "speaker": "agent",
+      "text": "Thank you, the patient is comparing options first, so we'll call back. Do you have any evening appointments?",
+      "t_seconds": 48.8
+    },
+    {
+      "speaker": "clinic",
+      "text": "No, we close at 4 PM, so no evening appointments.",
+      "t_seconds": 55.8
+    },
+    {
+      "speaker": "agent",
+      "text": "That's everything I needed, thank you so much for your help. Have a great day!",
+      "t_seconds": 59.6
+    }
+  ]
+}

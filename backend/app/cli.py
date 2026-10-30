@@ -4,16 +4,36 @@ import asyncio
 import logging
 import time
 
+from datetime import datetime
+
 import typer
 from rich.console import Console
+from rich.markup import escape
 
+from app.agent.caller import Caller
+from app.agent.extractor import CHECKLIST_ORDER, build_quote
 from app.clinics.simulator import ClinicSimulator
 from app.config import get_settings
 from app.data.loader import load_demo_clinics
 from app.integrations.meta_llm import stream_chat
+from app.schemas.enums import Speaker, Treatment
+from app.schemas.preferences import Preferences
+from app.schemas.quote import Quote
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
+
+# Fake intake answers until intake is built (the example from SETUP.md section 3.10).
+DEMO_PREFERENCES = Preferences(
+    treatment=Treatment.BRACES,
+    zip_code="76010",
+    max_distance_mi=15,
+    budget_max=5000,
+    pay_in_full_ok=True,
+    uses_hsa_fsa=True,
+    prefers_monthly=True,
+    must_haves=["evening hours"],
+)
 
 
 @app.callback()
@@ -80,6 +100,67 @@ def clinic_chat(clinic: str = typer.Option(..., help="Demo clinic id, e.g. parkw
         console.print(f"[red]Unknown clinic '{clinic}'. Choose from: {', '.join(clinics)}[/red]")
         raise typer.Exit(code=1)
     asyncio.run(_clinic_chat(ClinicSimulator(*clinics[clinic])))
+
+
+def _print_line(speaker: Speaker, text: str, t_seconds: float) -> None:
+    label = "[bold]LANA[/bold]" if speaker == Speaker.AGENT else "[magenta]CLINIC[/magenta]"
+    console.print(f"[dim]\\[{t_seconds:6.1f}s][/dim] {label}: {escape(text)}")
+
+
+def _value_text(value: object) -> str:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, int):
+        return f"${value:,}"
+    if isinstance(value, list):
+        items = [
+            f"{v:%a %b} {v.day} {v.hour % 12 or 12}:{v:%M} {'AM' if v.hour < 12 else 'PM'}"
+            if isinstance(v, datetime)
+            else str(v)
+            for v in value
+        ]
+        return ", ".join(items) or "none"
+    return str(value)
+
+
+def _print_quote(quote: Quote) -> None:
+    console.print(f"\n[bold]Quote for {quote.clinic_id}[/bold]")
+    for name in CHECKLIST_ORDER:
+        answer = getattr(quote.checklist, name)
+        if answer is None:
+            console.print(f"  {name}: [yellow]Not confirmed[/yellow]")
+            continue
+        console.print(
+            f"  {name}: {escape(_value_text(answer.value))}  "
+            f"[dim]\"{escape(answer.evidence)}\" at {answer.t_seconds:.1f}s[/dim]"
+        )
+    all_in = f"${quote.all_in_price:,}" if quote.all_in_price is not None else "Not confirmed"
+    console.print(f"  all-in price: [bold]{all_in}[/bold]")
+    console.print(f"  solid: {'yes' if quote.is_solid else 'no'}")
+    console.print(f"  missing: {', '.join(quote.missing_fields) or 'none'}")
+
+
+async def _simulate_call(clinic, sheet) -> None:
+    caller = Caller(clinic, DEMO_PREFERENCES, _print_line)
+    console.print(f"Calling {clinic.name} (call {caller.transcript.call_id}).\n")
+    result = await caller.run(ClinicSimulator(clinic, sheet))
+    _print_quote(build_quote(clinic.id, result.checklist))
+
+
+@app.command("simulate-call")
+def simulate_call(
+    clinic: str = typer.Option(..., help="Demo clinic id, e.g. sunrise"),
+    text_only: bool = typer.Option(False, "--text-only", help="Text lines only, no audio"),
+) -> None:
+    """Run Lana's checklist call against a demo clinic and print the transcript and Quote."""
+    if not text_only:
+        console.print("[red]Voice mode is not built yet. Run with --text-only.[/red]")
+        raise typer.Exit(code=1)
+    clinics = {c.id: (c, sheet) for c, sheet in load_demo_clinics()}
+    if clinic not in clinics:
+        console.print(f"[red]Unknown clinic '{clinic}'. Choose from: {', '.join(clinics)}[/red]")
+        raise typer.Exit(code=1)
+    asyncio.run(_simulate_call(*clinics[clinic]))
 
 
 if __name__ == "__main__":
