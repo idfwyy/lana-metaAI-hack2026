@@ -4,7 +4,9 @@ import asyncio
 import logging
 import time
 
+import json
 from datetime import datetime
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -12,9 +14,11 @@ from rich.markup import escape
 
 from app.agent.caller import Caller
 from app.agent.extractor import CHECKLIST_ORDER, build_quote
+from app.agent.negotiator import negotiate as run_negotiation
+from app.agent.negotiator import phrase_move, pick_target, plan_moves
 from app.clinics.simulator import ClinicSimulator
 from app.config import get_settings
-from app.data.loader import load_demo_clinics
+from app.data.loader import get_public_clinics, load_demo_clinics
 from app.integrations.meta_llm import stream_chat
 from app.schemas.enums import Speaker, Treatment
 from app.schemas.preferences import Preferences
@@ -161,6 +165,59 @@ def simulate_call(
         console.print(f"[red]Unknown clinic '{clinic}'. Choose from: {', '.join(clinics)}[/red]")
         raise typer.Exit(code=1)
     asyncio.run(_simulate_call(*clinics[clinic]))
+
+
+async def _negotiate(quotes: list[Quote], live: bool) -> None:
+    clinics = get_public_clinics()
+    for q in quotes:
+        price = f"${q.all_in_price:,}" if q.all_in_price is not None else "Not confirmed"
+        console.print(f"  {q.clinic_id}: {price} all in")
+    target_id = pick_target(quotes, clinics, DEMO_PREFERENCES)
+    if target_id is None:
+        console.print("\nNo target: the best fit already has the cheapest solid quote.")
+        return
+    target = next(q for q in quotes if q.clinic_id == target_id)
+    console.print(f"\n[bold]Target: {target_id}[/bold]")
+
+    moves = plan_moves(target, quotes, clinics, DEMO_PREFERENCES)
+    for i, move in enumerate(moves, start=1):
+        cites = f" (cites {move.cited_clinic}, ${move.cited_amount:,})" if move.cited_clinic else ""
+        console.print(f"\n{i}. {move.label}{escape(cites)}")
+        console.print(f"   [bold]LANA[/bold]: {escape(await phrase_move(move))}")
+
+    if not live:
+        return
+    sims = {c.id: (c, sheet) for c, sheet in load_demo_clinics()}
+    if target_id not in sims:
+        console.print(f"[red]No demo receptionist for '{target_id}'.[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"\n[bold]Live negotiation with {sims[target_id][0].name}[/bold]\n")
+    result = await run_negotiation(
+        target, moves, ClinicSimulator(*sims[target_id]), _print_line, call_id=f"negotiate-{target_id}"
+    )
+    console.print("\n[bold]Concessions won[/bold]")
+    for c in result.concessions:
+        console.print(
+            f"  {c.label}: ${c.amount:,}  [dim]\"{escape(c.evidence.evidence)}\" "
+            f"at {c.evidence.t_seconds:.1f}s[/dim]"
+        )
+    if not result.concessions:
+        console.print("  none")
+    console.print(f"  refused: {', '.join(result.refused) or 'none'}")
+    console.print(
+        f"  all in: ${result.first_all_in:,} -> ${result.final_all_in:,}, "
+        f"[bold]saved ${result.total_saved:,}[/bold]"
+    )
+
+
+@app.command()
+def negotiate(
+    fixture: Path = typer.Option(..., exists=True, dir_okay=False, help="JSON list of Quotes"),
+    live: bool = typer.Option(False, "--live", help="Also run the moves against the demo receptionist"),
+) -> None:
+    """Pick the negotiation target from saved quotes, plan the moves and phrase each one."""
+    quotes = [Quote.model_validate(q) for q in json.loads(fixture.read_text(encoding="utf-8"))]
+    asyncio.run(_negotiate(quotes, live))
 
 
 if __name__ == "__main__":

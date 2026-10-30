@@ -1,0 +1,203 @@
+[
+  {
+    "clinic_id": "parkway",
+    "checklist": {
+      "total_price": {
+        "value": 4800,
+        "speaker": "clinic",
+        "evidence": "Comprehensive treatment is $4,800.",
+        "call_id": "fixture-parkway-1",
+        "t_seconds": 10.4
+      },
+      "records_fee": {
+        "value": 250,
+        "speaker": "clinic",
+        "evidence": "there's a $250 records fee",
+        "call_id": "fixture-parkway-1",
+        "t_seconds": 17.7
+      },
+      "consult_fee": null,
+      "includes": {
+        "value": [
+          "braces",
+          "all adjustments",
+          "1 set of retainers",
+          "emergency visits"
+        ],
+        "speaker": "clinic",
+        "evidence": "braces, all adjustments, one set of retainers and emergency visits",
+        "call_id": "fixture-parkway-1",
+        "t_seconds": 25.4
+      },
+      "monthly_payment": {
+        "value": 180,
+        "speaker": "clinic",
+        "evidence": "$180 a month",
+        "call_id": "fixture-parkway-1",
+        "t_seconds": 33.1
+      },
+      "down_payment": {
+        "value": 1000,
+        "speaker": "clinic",
+        "evidence": "$1,000 down",
+        "call_id": "fixture-parkway-1",
+        "t_seconds": 33.1
+      },
+      "payment_plan": null,
+      "next_slots": {
+        "value": [
+          "2026-11-02T17:30:00-06:00",
+          "2026-11-04T18:00:00-06:00"
+        ],
+        "speaker": "clinic",
+        "evidence": "Monday at 5:30 PM or Wednesday at 6:00 PM",
+        "call_id": "fixture-parkway-1",
+        "t_seconds": 41.5
+      },
+      "evening_hours": {
+        "value": true,
+        "speaker": "clinic",
+        "evidence": "we're open until 7 Monday through Thursday",
+        "call_id": "fixture-parkway-1",
+        "t_seconds": 53.1
+      },
+      "needs_exam_first": null
+    },
+    "all_in_price": 5050,
+    "missing_fields": [],
+    "is_solid": true
+  },
+  {
+    "clinic_id": "sunrise",
+    "checklist": {
+      "total_price": {
+        "value": 4200,
+        "speaker": "clinic",
+        "evidence": "$4,200 for comprehensive treatment.",
+        "call_id": "fixture-sunrise-1",
+        "t_seconds": 10.4
+      },
+      "records_fee": {
+        "value": 0,
+        "speaker": "clinic",
+        "evidence": "no records fee.",
+        "call_id": "fixture-sunrise-1",
+        "t_seconds": 17.7
+      },
+      "consult_fee": null,
+      "includes": {
+        "value": [
+          "braces",
+          "adjustments"
+        ],
+        "speaker": "clinic",
+        "evidence": "covers braces and adjustments,",
+        "call_id": "fixture-sunrise-1",
+        "t_seconds": 25.4
+      },
+      "monthly_payment": {
+        "value": 175,
+        "speaker": "clinic",
+        "evidence": "$175 a month",
+        "call_id": "fixture-sunrise-1",
+        "t_seconds": 33.1
+      },
+      "down_payment": {
+        "value": 500,
+        "speaker": "clinic",
+        "evidence": "$500 down.",
+        "call_id": "fixture-sunrise-1",
+        "t_seconds": 33.1
+      },
+      "payment_plan": null,
+      "next_slots": {
+        "value": [
+          "2026-10-30T07:30:00-05:00",
+          "2026-11-03T10:00:00-06:00"
+        ],
+        "speaker": "clinic",
+        "evidence": "Friday, October 30 at 7:30 AM, Tuesday, November 3 at 10:00 AM",
+        "call_id": "fixture-sunrise-1",
+        "t_seconds": 41.5
+      },
+      "evening_hours": {
+        "value": false,
+        "speaker": "clinic",
+        "evidence": "so no evenings.",
+        "call_id": "fixture-sunrise-1",
+        "t_seconds": 53.1
+      },
+      "needs_exam_first": null
+    },
+    "all_in_price": 4200,
+    "missing_fields": [],
+    "is_solid": true
+  },
+  {
+    "clinic_id": "lakeside",
+    "checklist": {
+      "total_price": {
+        "value": 4500,
+        "speaker": "clinic",
+        "evidence": "Treatment is $4,500.",
+        "call_id": "fixture-lakeside-1",
+        "t_seconds": 10.4
+      },
+      "records_fee": {
+        "value": 150,
+        "speaker": "clinic",
+        "evidence": "a $150 records fee",
+        "call_id": "fixture-lakeside-1",
+        "t_seconds": 17.7
+      },
+      "consult_fee": null,
+      "includes": {
+        "value": [
+          "braces",
+          "adjustments",
+          "1 set of retainers"
+        ],
+        "speaker": "clinic",
+        "evidence": "braces, adjustments and one set of retainers",
+        "call_id": "fixture-lakeside-1",
+        "t_seconds": 25.4
+      },
+      "monthly_payment": {
+        "value": 190,
+        "speaker": "clinic",
+        "evidence": "$190 a month",
+        "call_id": "fixture-lakeside-1",
+        "t_seconds": 33.1
+      },
+      "down_payment": {
+        "value": 800,
+        "speaker": "clinic",
+        "evidence": "$800 down",
+        "call_id": "fixture-lakeside-1",
+        "t_seconds": 33.1
+      },
+      "payment_plan": null,
+      "next_slots": {
+        "value": [
+          "2026-10-31T09:30:00-05:00",
+          "2026-11-03T15:00:00-06:00"
+        ],
+        "speaker": "clinic",
+        "evidence": "Saturday at 9:30 AM or Tuesday at 3:00 PM",
+        "call_id": "fixture-lakeside-1",
+        "t_seconds": 41.5
+      },
+      "evening_hours": {
+        "value": false,
+        "speaker": "clinic",
+        "evidence": "we don't have evening hours",
+        "call_id": "fixture-lakeside-1",
+        "t_seconds": 53.1
+      },
+      "needs_exam_first": null
+    },
+    "all_in_price": 4650,
+    "missing_fields": [],
+    "is_solid": true
+  }
+]
