@@ -26,6 +26,7 @@ def test_demo_clinic_fields():
         assert clinic.phone.startswith("555-01")
         assert clinic.voice_id is not None and clinic.voice_id.startswith("VOICE_CLINIC_")
         assert sheet.personality
+        assert sheet.includes and "braces" in sheet.includes
 
 
 def test_floor_price_not_above_list_price():

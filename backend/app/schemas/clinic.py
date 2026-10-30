@@ -24,6 +24,7 @@ class PriceSheet(BaseModel):
     consult_fee: int = Field(ge=0)
     monthly: int = Field(ge=0)
     down_payment: int = Field(ge=0)
+    includes: list[str] = Field(description="What the treatment price covers")
     floor_price: int = Field(ge=0)
     will_price_match: bool
     will_waive_records: bool

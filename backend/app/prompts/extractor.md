@@ -25,6 +25,7 @@ Today is {today}. The clinic is in the {timezone} time zone.
 
 ## Rules
 
+- Fill every field the clinic has stated in any line of the call, not only the one Lana just asked about. One line can fill several fields: "$180 a month with $500 down" fills both monthly_payment (180) and down_payment (500), each with its own evidence.
 - Use only what a CLINIC line clearly says. Never use LANA's lines as a source, even if the clinic agrees with them; quote the clinic's own words instead.
 - For every field you fill, "evidence" must be words copied exactly, in order, from one CLINIC line. Copy the shortest part that proves the value, for example "$4,200 total".
 - If the clinic did not say it, was unsure, or said it would need to check, use null. Never guess or work a number out yourself.

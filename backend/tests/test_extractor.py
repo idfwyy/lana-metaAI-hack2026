@@ -108,6 +108,34 @@ async def test_evidence_matches_ignoring_case_and_punctuation(fake_json) -> None
     assert checklist.evening_hours.t_seconds == 55.8
 
 
+async def test_one_clinic_line_fills_two_fields(fake_json) -> None:
+    transcript = Transcript.model_validate(
+        {
+            "call_id": "c2",
+            "clinic_id": "parkway",
+            "lines": [
+                {"speaker": "agent", "text": "What's the monthly payment?", "t_seconds": 0.0},
+                {"speaker": "clinic", "text": "It's $180 a month with $500 down.", "t_seconds": 1.5},
+            ],
+        }
+    )
+    fake = fake_json(
+        {
+            "monthly_payment": {"value": 180, "evidence": "$180 a month"},
+            "down_payment": {"value": 500, "evidence": "$500 down"},
+        }
+    )
+
+    checklist = await update_checklist(ClinicChecklist(), transcript)
+
+    assert checklist.monthly_payment.value == 180
+    assert checklist.monthly_payment.evidence == "$180 a month"
+    assert checklist.down_payment.value == 500
+    assert checklist.down_payment.evidence == "$500 down."
+    assert checklist.monthly_payment.t_seconds == checklist.down_payment.t_seconds == 1.5
+    assert "not only the one Lana just asked about" in fake.prompts[0]
+
+
 def test_find_evidence_needs_whole_words() -> None:
     line = "Comprehensive braces are $4,200 total."
     assert find_evidence("$200 total", line) is None

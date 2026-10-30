@@ -80,7 +80,7 @@ def _slot(dt: datetime) -> str:
     return f"{dt:%A, %B} {dt.day} at {hour}:{dt:%M} {'AM' if dt.hour < 12 else 'PM'}"
 
 
-def _price_sheet_text(sheet: PriceSheet) -> str:
+def _price_sheet_text(clinic: Clinic, sheet: PriceSheet) -> str:
     consult = "free" if sheet.consult_fee == 0 else _money(sheet.consult_fee)
     records = "none"
     if sheet.records_fee:
@@ -88,7 +88,9 @@ def _price_sheet_text(sheet: PriceSheet) -> str:
     slots = "; ".join(_slot(dt) for dt in sheet.open_slots) or "none this week"
     return "\n".join(
         [
+            f"- Office hours: {clinic.hours}",
             f"- Comprehensive orthodontic treatment: {_money(sheet.list_price)}",
+            f"- The treatment price includes: {', '.join(sheet.includes) or 'nothing extra'}",
             f"- Records fee (x-rays and scans): {records}",
             f"- Consult: {consult}",
             f"- Monthly plan: {_money(sheet.monthly)} a month with "
@@ -140,7 +142,7 @@ class ClinicSimulator:
             clinic_name=clinic.name,
             personality=price_sheet.personality,
             today=f"{today:%A, %B} {today.day}",
-            price_sheet=_price_sheet_text(price_sheet),
+            price_sheet=_price_sheet_text(clinic, price_sheet),
             concessions=_concessions_text(price_sheet),
             floor_price=price_sheet.floor_price,
         )
