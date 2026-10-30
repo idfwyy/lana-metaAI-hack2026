@@ -289,3 +289,40 @@ async def test_on_checklist_called_only_on_change(chat, monkeypatch: pytest.Monk
     await Caller(_clinic(), PREFS, lambda *a: None, on_checklist=on_checklist).run(FakeReceptionist())
 
     assert seen == [filled, FULL]
+
+
+LEAKED = (
+    "I'll ask about their next available consult slots.Thanks for that, "
+    "and when are your next openings?"
+)
+CLEAN = "Thanks, that helps. Is there a separate records fee for x-rays and scans?"
+
+
+def test_spoken_drops_planning_note() -> None:
+    assert caller._spoken(LEAKED) == ("", "Thanks for that, and when are your next openings?")
+
+
+def test_spoken_keeps_clean_line() -> None:
+    ack, question = caller._spoken(CLEAN)
+    assert f"{ack} {question}" == CLEAN
+
+
+async def test_leaked_planning_note_is_not_said(chat, no_extraction) -> None:
+    chat.replies = [LEAKED, CLEAN]
+    lines, on_line = _recorder()
+
+    await Caller(_clinic(), PREFS, on_line).run(FakeReceptionist())
+
+    lana = _lana(lines)
+    assert lana[0].endswith(" Thanks for that, and when are your next openings?")
+    assert "I'll ask" not in lana[0]
+    assert lana[1] == CLEAN
+
+
+async def test_only_self_talk_uses_fallback(chat, no_extraction) -> None:
+    chat.replies = ["Let me ask about the total price. Next I'll ask about the records fee."]
+    lines, on_line = _recorder()
+
+    await Caller(_clinic(), PREFS, on_line).run(FakeReceptionist())
+
+    assert lines[0][1].endswith(FALLBACK_QUESTIONS["total_price"])

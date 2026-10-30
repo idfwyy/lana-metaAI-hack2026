@@ -32,7 +32,7 @@ CLOSING_LINE = "That's everything I needed, thank you so much for your help. Hav
 # Said instead of CLOSING_LINE when the orchestrator wants to come back to this call.
 HOLD_REQUEST = "Could you hold for just a moment? I want to check one thing for the patient."
 
-# Said instead of the model's line when it is empty or names another clinic.
+# Said instead of the model's line when it is empty, has no question, or names another clinic.
 FALLBACK_QUESTIONS = {
     "total_price": "How much is the full treatment at your office?",
     "records_fee": "Is there a separate records fee for x-rays and scans?",
@@ -88,6 +88,37 @@ def _clean(line: str) -> str:
     line = re.sub(r"^\s*\**\s*lana\s*\**\s*:\s*", "", line.strip(), flags=re.IGNORECASE)
     line = re.sub(r"\s*—\s*", ", ", line)
     return line.strip().strip('"').strip()
+
+
+# A sentence end, including "slots.Thanks" where the model left out the space.
+# Only a capital letter counts after a bare period, so "5 p.m." stays whole.
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+|(?<=[.!?])(?=[A-Z])")
+# Lana narrating her own plan ("I'll ask about their next slots.") instead of speaking.
+_SELF_TALK = re.compile(
+    r"^(?:(?:okay|ok|so|now|next|then),?\s+)*"
+    r"(?:i'll|i will|i'm going to|i am going to|let me|i need to|i should|i want to|i'd like to)\s+"
+    r"(?:now\s+|next\s+|then\s+)?"
+    r"(?:ask|inquire|find out|move on|follow up|confirm|check on|request|get)\b",
+    re.IGNORECASE,
+)
+MAX_ACK_WORDS = 15
+
+
+def _spoken(line: str) -> tuple[str, str]:
+    """Split a model line into (acknowledgement, question), dropping planning notes.
+
+    Keeps the first question and at most one short non-question sentence right before it.
+    Either part can be empty.
+    """
+    sentences = [s.strip() for s in _SENTENCE_END.split(line) if s.strip()]
+    sentences = [s for s in sentences if s.endswith("?") or not _SELF_TALK.match(s)]
+    for i, sentence in enumerate(sentences):
+        if sentence.endswith("?"):
+            before = sentences[i - 1] if i else ""
+            ack = before if len(before.split()) <= MAX_ACK_WORDS else ""
+            return ack, sentence
+    ack = sentences[0] if sentences and len(sentences[0].split()) <= MAX_ACK_WORDS else ""
+    return ack, ""
 
 
 def _names_pattern(names: list[str]) -> re.Pattern[str] | None:
@@ -179,11 +210,18 @@ class Caller:
         except Exception as err:
             log.warning("caller call=%s turn failed, using fallback: %s", self.transcript.call_id, err)
             line = ""
-        if not line or (self._other_clinics and self._other_clinics.search(line)):
-            if line:
-                log.warning("caller call=%s line named another clinic: %r", self.transcript.call_id, line)
+        if line and self._other_clinics and self._other_clinics.search(line):
+            log.warning("caller call=%s line named another clinic: %r", self.transcript.call_id, line)
             return FALLBACK_QUESTIONS[fields[0]]
-        return line
+        ack, question = _spoken(line)
+        if not question:
+            if line:
+                log.warning("caller call=%s line had no usable question: %r", self.transcript.call_id, line)
+            question = FALLBACK_QUESTIONS[fields[0]]
+        spoken = f"{ack} {question}" if ack else question
+        if spoken != line:
+            log.info("caller call=%s cleaned line %r -> %r", self.transcript.call_id, line, spoken)
+        return spoken
 
     async def _say(self, speaker: Speaker, text: str) -> None:
         t = round(self._clock, 1)
