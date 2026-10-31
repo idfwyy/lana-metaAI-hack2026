@@ -14,6 +14,7 @@ from rich.markup import escape
 
 from app.agent.caller import Caller
 from app.agent.extractor import CHECKLIST_ORDER, build_quote
+from app.agent.intake import Intake
 from app.agent.negotiator import negotiate as run_negotiation
 from app.agent.negotiator import phrase_move, pick_target, plan_moves
 from app.agent.orchestrator import Orchestrator
@@ -40,7 +41,7 @@ from app.schemas.quote import Quote
 app = typer.Typer(no_args_is_help=True)
 console = Console()
 
-# Fake intake answers until intake is built (the example from SETUP.md section 3.10).
+# Fixed intake answers for commands that skip intake (the example from SETUP.md section 3.10).
 DEMO_PREFERENCES = Preferences(
     treatment=Treatment.BRACES,
     zip_code="76010",
@@ -335,12 +336,71 @@ def run_demo(
     if not text_only:
         console.print("[red]Voice mode is not built yet. Run with --text-only.[/red]")
         raise typer.Exit(code=1)
-    case = Case(preferences=DEMO_PREFERENCES, mode=mode)
+    _run_case(DEMO_PREFERENCES, mode, clinics)
+
+
+def _run_case(prefs: Preferences, mode: DemoMode, clinics: int) -> None:
+    case = Case(preferences=prefs, mode=mode)
     asyncio.run(Orchestrator(case, _EventPrinter(), max_clinics=clinics).run())
     if case.status == CaseStatus.ERROR:
         raise typer.Exit(code=1)
     _print_offers(case)
     _print_savings(case)
+
+
+def _print_lana(text: str) -> None:
+    console.print(f"[bold green_yellow]LANA[/bold green_yellow]: [green_yellow]{escape(text)}[/green_yellow]")
+
+
+@app.command("intake-text")
+def intake_text(text: str = typer.Argument(..., help="One thing the patient says")) -> None:
+    """Run one patient reply through intake and print what it filled and the next question."""
+    intake = Intake()
+    turn = asyncio.run(intake.hear(text))
+    console.print(f"[bold]Filled:[/bold] {', '.join(turn.filled) or 'nothing'}")
+    console.print("[bold]Draft:[/bold]")
+    console.print_json(intake.draft.model_dump_json())
+    console.print(f"[bold]Next question:[/bold] {escape(turn.next_question or 'none, intake is done')}")
+    _print_lana(turn.spoken)
+
+
+async def _intake_chat(intake: Intake) -> bool:
+    """Typed back-and-forth until intake is done. False if the patient quit first."""
+    _print_lana(intake.first_line())
+    while True:
+        try:
+            line = console.input("[bold]YOU>[/bold] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if line.lower() == "quit":
+            return False
+        if not line:
+            continue
+        try:
+            turn = await intake.hear(line)
+        except Exception as err:
+            console.print(f"[red]{type(err).__name__}: {escape(str(err))}. Try typing that again.[/red]")
+            continue
+        if turn.filled:
+            console.print(f"[dim]  filled: {', '.join(turn.filled)}[/dim]")
+        _print_lana(turn.spoken)
+        if turn.done:
+            return True
+
+
+@app.command("intake-chat")
+def intake_chat(
+    run: bool = typer.Option(False, "--run", help="Then run the text demo with these preferences"),
+) -> None:
+    """Chat with Lana by typing until intake is done, then print the final Preferences."""
+    intake = Intake()
+    if not asyncio.run(_intake_chat(intake)):
+        raise typer.Exit(code=1)
+    prefs = intake.to_preferences()
+    console.print("\n[bold]Preferences[/bold]")
+    console.print_json(prefs.model_dump_json())
+    if run:
+        _run_case(prefs, DemoMode.WATCH, clinics=2)
 
 
 if __name__ == "__main__":
