@@ -27,7 +27,10 @@ log = logging.getLogger(__name__)
 
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "caller.md"
 
-DISCLOSURE = "Hi, this is {agent_name}, an AI assistant calling for a patient, and this call is recorded."
+DISCLOSURE = (
+    "Hi there! This is {agent_name}, I'm an AI assistant calling for a patient. "
+    "Just so you know, this call's recorded."
+)
 CLOSING_LINE = "That's everything I needed, thank you so much for your help. Have a great day!"
 # Said instead of CLOSING_LINE when the orchestrator wants to come back to this call.
 HOLD_REQUEST = "Could you hold for just a moment? I want to check one thing for the patient."

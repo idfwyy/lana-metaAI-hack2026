@@ -58,6 +58,18 @@ class Settings(BaseSettings):
 
     # Voice
     elevenlabs_api_key: SecretStr = SecretStr("")
+    # TTS model per speaker. A blank one falls back to ELEVENLABS_MODEL, then to the default
+    # (see _tts_models below).
+    elevenlabs_model: str = ""
+    elevenlabs_model_agent: str = ""
+    elevenlabs_model_clinic: str = ""
+    # Audio tag put before Lana's lines when her model performs tags. Never shown on screen.
+    elevenlabs_tag_agent: str = "[warmly]"
+    # Voice settings sent with every line (and part of the TTS cache key).
+    elevenlabs_stability: float = Field(default=0.4, ge=0, le=1)
+    elevenlabs_similarity: float = Field(default=0.8, ge=0, le=1)
+    elevenlabs_style: float = Field(default=0.3, ge=0, le=1)
+    elevenlabs_speaker_boost: bool = True
     agent_name: str = "Lana"
     voice_agent: str = ""
     voice_clinic_1: str = ""
@@ -84,6 +96,12 @@ class Settings(BaseSettings):
     def _valid_timezone(cls, v: str) -> str:
         ZoneInfo(v)
         return v
+
+    @model_validator(mode="after")
+    def _tts_models(self) -> "Settings":
+        self.elevenlabs_model_agent = self.elevenlabs_model_agent or self.elevenlabs_model or "eleven_v4_turbo"
+        self.elevenlabs_model_clinic = self.elevenlabs_model_clinic or self.elevenlabs_model or "eleven_flash_v2_5"
+        return self
 
     @cached_property
     def tz(self) -> ZoneInfo:

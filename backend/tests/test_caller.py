@@ -120,8 +120,8 @@ async def test_first_line_is_exact_disclosure_then_question(chat, no_extraction)
 
     disclosure = DISCLOSURE.format(agent_name=get_settings().agent_name)
     assert disclosure == (
-        f"Hi, this is {get_settings().agent_name}, an AI assistant calling for a patient, "
-        "and this call is recorded."
+        f"Hi there! This is {get_settings().agent_name}, I'm an AI assistant calling for a patient. "
+        "Just so you know, this call's recorded."
     )
     assert lines[0] == (
         Speaker.AGENT,

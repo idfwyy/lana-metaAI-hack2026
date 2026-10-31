@@ -2,6 +2,49 @@
 
 Newest first.
 
+## 2026-10-31: TTS model per speaker, and a reworded disclosure
+
+- Lana uses `eleven_v4_turbo` (`ELEVENLABS_MODEL_AGENT`) with a `[warmly]` audio tag (`ELEVENLABS_TAG_AGENT`) in front of each line for a more natural, expressive voice. The tag is sent only when her model supports audio tags and is never shown on screen.
+- Clinics use `eleven_flash_v2_5` (`ELEVENLABS_MODEL_CLINIC`) because it is cheaper and faster, and it sounded better for the clinic voices in a side-by-side test against `eleven_v4_turbo`.
+- `ELEVENLABS_MODEL` still works as a fallback for either speaker when set. The model and the tag are part of the TTS cache key.
+- The disclosure was reworded to sound natural: "Hi there! This is Lana, I'm an AI assistant calling for a patient. Just so you know, this call's recorded." It still states that Lana is an AI and that the call is recorded. The name comes from `AGENT_NAME`.
+
+## 2026-10-31: eleven_v4_turbo, voice settings and audio tags
+
+Sources: ElevenLabs Models, https://elevenlabs.io/docs/models; Stream speech API reference, https://elevenlabs.io/docs/api-reference/text-to-speech/stream; prompting guide (audio tags, covers Eleven v4), https://elevenlabs.io/docs/best-practices/prompting/eleven-v3; Text to Dialogue stream, https://elevenlabs.io/docs/api-reference/text-to-dialogue/stream; plus a live `GET /v1/models` with our key.
+
+- Model ID is `eleven_v4_turbo` (released with `eleven_v4`). The Models page calls it the real-time model, with a median latency of about 100 ms not counting the network, and mentions only "the Text to Dialogue websocket" as where it's available. `eleven_turbo_v2_5` and `eleven_turbo_v2` are now deprecated.
+- Streaming through the Python SDK: `GET /v1/models` reports `can_do_text_to_speech: true` for `eleven_v4_turbo` (10,000 characters per request). The same `client.text_to_speech.stream(voice_id, text=..., model_id="eleven_v4_turbo", voice_settings=..., output_format=...)` call we already use works: tested live, HTTP 200, mp3 streamed. No code path change was needed.
+- Audio tags: v4 Turbo lists "Audio tags for fine-grained control". The syntax is inline square brackets, for example `[laughs]`, `[whispers]`, `[sighs]`, `[curious]`, `[excited]`. SSML `<break>` is not supported on v3 or v4 (third-party source, not confirmed in the official docs).
+  - `tts.AUDIO_TAG_MODELS` = `eleven_v3`, `eleven_v3_conversational`, `eleven_v4`, `eleven_v4_turbo`. For any other model (for example flash), tags are stripped before sending so they are never read aloud.
+  - On screen, always show `tts.strip_audio_tags(text)`.
+- Voice settings (TTS API reference): `stability` (default 0.5), `similarity_boost` (0.75), `style` (0), `use_speaker_boost` (true), `speed` (1.0; the prompting guide gives 0.7 to 1.2). New settings `ELEVENLABS_STABILITY` 0.4, `ELEVENLABS_SIMILARITY` 0.8, `ELEVENLABS_STYLE` 0.3, `ELEVENLABS_SPEAKER_BOOST` true are sent with every line, and they are part of the cache key, so changing them makes new audio. Old cache files (keyed without settings) are simply never hit again.
+- Caveat: `GET /v1/models` reports `can_use_style: false` and `can_use_speaker_boost: false` for `eleven_v4_turbo`, `eleven_v4`, `eleven_v3` and `eleven_flash_v2_5`, so `style` and speaker boost are probably ignored by these models. The API accepted them without an error. Stability 0.3 and 0.4 were accepted on v4 Turbo (no fixed 0 / 0.5 / 1 steps).
+- `agent say` takes `--model` and `--stability` to compare without editing `.env`.
+- First-chunk latency measured today (Lana disclosure, 83 characters, new connection each run): flash 0.58 s, v4 Turbo 0.69 s, v4 Turbo with stability 0.3 1.44 s. Parkway price line (45 characters): flash 0.81 s, v4 Turbo 0.82 s. One run each, so treat these as rough. Not decided yet which model to use; the default stays `eleven_flash_v2_5` until we listen.
+
+## 2026-10-31: ElevenLabs streaming text to speech (voice/tts.py)
+
+Sources: ElevenLabs API reference, Stream speech, https://elevenlabs.io/docs/api-reference/text-to-speech/stream; Get user subscription, https://elevenlabs.io/docs/api-reference/user/subscription/get; SDK README, https://github.com/elevenlabs/elevenlabs-python. The API reference shows only raw HTTP examples, so the SDK call below was confirmed in the installed SDK (`elevenlabs` 2.74.1, `text_to_speech/client.py`).
+
+- Endpoint: `POST /v1/text-to-speech/{voice_id}/stream?output_format=...`, auth header `xi-api-key`.
+- SDK call we use:
+  ```python
+  client = AsyncElevenLabs(api_key=..., timeout=8)
+  async for chunk in client.text_to_speech.stream(
+      voice_id, text=text, model_id="eleven_flash_v2_5", output_format="mp3_44100_128",
+      request_options={"timeout_in_seconds": 8, "max_retries": 0},
+  ):
+      ...  # bytes
+  ```
+  On the async client, `stream` is an async generator: iterate it, don't `await` it.
+- Model comes from the new setting `ELEVENLABS_MODEL` (default `eleven_flash_v2_5`). Output is `mp3_44100_128` (the API default; 192 kbps needs Creator tier).
+- Timeout: 8 s for the request and 8 s for each wait on the next chunk. SDK retries are off. On any failure `stream_speech` logs and stops, so the caller shows the text only. Audio already yielded before a mid-line failure can't be taken back, and a partly received line is never cached.
+- Cache: `backend/.cache/tts/<sha256(voice_id, model, text)>.mp3`, joined with newlines so the parts can't run together. Only fully received lines are written, through a temp file. `agent tts-prewarm` caches Lana's disclosure, greeting, the 6 intake questions and the hold request.
+- Usage: `client.user.subscription.get()` returns `character_count` and `character_limit` (needs a key with User read access). Our key is Starter tier, 38,417 characters a month.
+- Voice IDs: our voices come from the Voice Library. `voices.get(id)` returns 400 `voice_not_found` for a library voice until it has been used once, but text to speech still works with the ID. `agent tts-check` falls back to `voices.get_shared(search=id)` to confirm those.
+- Measured latency (first chunk): about 5 to 6 s the first time a library voice is ever used, 0.75 s on a new connection afterwards, 0.13 s on a warm connection. So: one SDK client per event loop (connection reuse), and the server should prewarm or make one request per voice at startup.
+
 ## 2026-10-29: reasoning_effort="minimal" for live call turns (CALL_REASONING)
 
 Source: Meta Model API docs, Reasoning guide, https://dev.meta.ai/docs/reasoning (re-checked today; matches the 2026-10-28 entry below).

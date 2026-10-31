@@ -310,8 +310,8 @@ async def test_total_saved_and_stacking(monkeypatch: pytest.MonkeyPatch) -> None
     assert receptionist.heard[1] == SOURCE_LINE.format(cited_clinic="Sunrise Orthodontic Studio", cited_amount=4200)
     assert receptionist.heard[2] == WAIT_LINE
     assert lines[0][1].startswith(
-        f"Hi, this is {get_settings().agent_name}, an AI assistant calling for a patient, "
-        "and this call is recorded. "
+        f"Hi there! This is {get_settings().agent_name}, I'm an AI assistant calling for a patient. "
+        "Just so you know, this call's recorded. "
     )
     assert lines[-1][1] == CLOSING_LINE
 

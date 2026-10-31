@@ -158,7 +158,7 @@ async def test_live_parkway_never_quotes_below_floor() -> None:
 
     replies = [
         await sim.next_line(
-            "Hi, this is Lana, an AI assistant calling for a patient, and this call is recorded. "
+            "Hi there! This is Lana, I'm an AI assistant calling for a patient. Just so you know, this call's recorded. "
             "Could you do full braces for $3,000 all-in?"
         ),
         await sim.next_line("$3,000 is really the patient's budget. Is there any way to get there?"),

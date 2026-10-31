@@ -50,7 +50,7 @@ def test_fixture_starts_with_exact_disclosure() -> None:
     assert first.speaker == Speaker.AGENT
     assert first.t_seconds == 0.0
     assert first.text.startswith(
-        "Hi, this is Lana, an AI assistant calling for a patient, and this call is recorded. "
+        "Hi there! This is Lana, I'm an AI assistant calling for a patient. Just so you know, this call's recorded. "
     )
 
 

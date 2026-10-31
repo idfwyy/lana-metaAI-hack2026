@@ -4,7 +4,7 @@
   "lines": [
     {
       "speaker": "agent",
-      "text": "Hi, this is Lana, an AI assistant calling for a patient, and this call is recorded. How much is comprehensive braces treatment at your office?",
+      "text": "Hi there! This is Lana, I'm an AI assistant calling for a patient. Just so you know, this call's recorded. How much is comprehensive braces treatment at your office?",
       "t_seconds": 0.0
     },
     {

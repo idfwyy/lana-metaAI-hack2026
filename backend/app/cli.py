@@ -9,12 +9,15 @@ from datetime import datetime
 from pathlib import Path
 
 import typer
+from elevenlabs import AsyncElevenLabs
+from elevenlabs.core.api_error import ApiError
 from rich.console import Console
 from rich.markup import escape
 
-from app.agent.caller import Caller
+from app.agent.caller import DISCLOSURE, HOLD_REQUEST, Caller
 from app.agent.extractor import CHECKLIST_ORDER, build_quote
-from app.agent.intake import Intake
+from app.agent.intake import TOPIC_FIELDS, Intake
+from app.agent.intake import _prompts as intake_prompts
 from app.agent.negotiator import negotiate as run_negotiation
 from app.agent.negotiator import phrase_move, pick_target, plan_moves
 from app.agent.orchestrator import Orchestrator
@@ -37,6 +40,16 @@ from app.schemas.events import (
 )
 from app.schemas.preferences import Preferences
 from app.schemas.quote import Quote
+from app.voice.tts import (
+    VoiceConfigError,
+    check_voices,
+    is_cached,
+    model_for,
+    prewarm,
+    stream_speech,
+    strip_audio_tags,
+    voice_for,
+)
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
@@ -401,6 +414,144 @@ def intake_chat(
     console.print_json(prefs.model_dump_json())
     if run:
         _run_case(prefs, DemoMode.WATCH, clinics=2)
+
+
+def _voice_by_name(name: str) -> str:
+    """'lana' or a demo clinic id -> ElevenLabs voice ID. Exits with a clear message if it can't."""
+    try:
+        if name == "lana":
+            return voice_for(Speaker.AGENT)
+        clinics = {c.id: c for c in get_public_clinics()}
+        if name not in clinics:
+            console.print(f"[red]Unknown voice '{name}'. Choose from: lana, {', '.join(clinics)}[/red]")
+            raise typer.Exit(code=1)
+        return voice_for(Speaker.CLINIC, clinics[name])
+    except VoiceConfigError as err:
+        console.print(f"[red]{escape(str(err))}[/red]")
+        raise typer.Exit(code=1)
+
+
+async def _collect(text: str, voice_id: str, **overrides) -> tuple[bytes, float | None]:
+    """All audio for one line, and seconds until the first chunk arrived."""
+    started, first, chunks = time.perf_counter(), None, []
+    async for chunk in stream_speech(text, voice_id, **overrides):
+        if first is None:
+            first = time.perf_counter() - started
+        chunks.append(chunk)
+    return b"".join(chunks), first
+
+
+@app.command()
+def say(
+    text: str = typer.Argument(..., help="The line to speak"),
+    voice: str = typer.Option("lana", "--voice", help="lana or a demo clinic id: parkway, sunrise, lakeside"),
+    out: Path = typer.Option(..., "--out", dir_okay=False, help="Where to save the mp3"),
+    model: str | None = typer.Option(None, "--model", help="Override the speaker's model"),
+    stability: float | None = typer.Option(None, "--stability", min=0, max=1, help="Override ELEVENLABS_STABILITY"),
+) -> None:
+    """Speak one line with ElevenLabs (or the cache) and save it as an mp3."""
+    voice_id = _voice_by_name(voice)
+    speaker = Speaker.AGENT if voice == "lana" else Speaker.CLINIC
+    overrides = {"speaker": speaker, "model": model, "stability": stability}
+    hit = is_cached(text, voice_id, **overrides)
+    audio, first = asyncio.run(_collect(text, voice_id, **overrides))
+    if not audio:
+        console.print("[red]No audio (see the log above). The app would show the text only.[/red]")
+        raise typer.Exit(code=1)
+    out.write_bytes(audio)
+    source = "cache hit, no API call" if hit else "cache miss, characters sent are in the log above"
+    used = model or model_for(speaker)
+    console.print(f"Saved {len(audio):,} bytes to {out} ({source}). Model {used}, first chunk {first:.2f}s.")
+    console.print(f"On screen: {escape(strip_audio_tags(text))}")
+
+
+def _missing_permission(err: ApiError) -> bool:
+    return err.status_code == 401 and "missing_permissions" in str(err.body)
+
+
+async def _tts_check(voices: dict[str, str]) -> bool:
+    settings = get_settings()
+    client = AsyncElevenLabs(api_key=settings.elevenlabs_api_key.get_secret_value(), timeout=8)
+    ok = True
+    try:
+        sub = await client.user.subscription.get()
+        left = sub.character_limit - sub.character_count
+        console.print(
+            f"API key works. Characters this month: {sub.character_count:,} used, "
+            f"{left:,} left of {sub.character_limit:,} ({sub.tier} tier)."
+        )
+    except ApiError as err:
+        if not _missing_permission(err):
+            console.print(f"[red]API key failed: HTTP {err.status_code}: {escape(str(err.body))}[/red]")
+            return False
+        console.print("[yellow]This key has no User access, so usage and credits left can't be shown.[/yellow]")
+    except Exception as err:
+        console.print(f"[red]Could not reach ElevenLabs: {type(err).__name__}: {escape(str(err))}[/red]")
+        return False
+
+    for name, voice_id in voices.items():
+        try:
+            found = await client.voices.get(voice_id)
+            console.print(f"  {name}: {voice_id} -> {escape(found.name or 'unnamed')}")
+        except ApiError as err:
+            if err.status_code == 400 and "voice_not_found" in str(err.body):
+                # Not in My Voices. Voice Library voices still work for text to speech.
+                shared = await client.voices.get_shared(search=voice_id, page_size=5)
+                match = next((v for v in shared.voices if v.voice_id == voice_id), None)
+                if match is not None:
+                    console.print(f"  {name}: {voice_id} -> {escape(match.name or 'unnamed')} (Voice Library)")
+                    continue
+            if _missing_permission(err):
+                console.print(f"[yellow]  {name}: {voice_id} not confirmed, the key has no Voices read access[/yellow]")
+                continue
+            ok = False
+            detail = err.body.get("detail", err.body) if isinstance(err.body, dict) else err.body
+            message = detail.get("message", detail) if isinstance(detail, dict) else detail
+            console.print(f"[red]  {name}: {voice_id} does not resolve (HTTP {err.status_code}): {escape(str(message))}[/red]")
+    console.print(
+        f"Models: Lana {settings.elevenlabs_model_agent} (tag {settings.elevenlabs_tag_agent or 'none'}), "
+        f"clinics {settings.elevenlabs_model_clinic}"
+    )
+    return ok
+
+
+@app.command("tts-check")
+def tts_check() -> None:
+    """Check the ElevenLabs key, that every voice ID resolves, and the characters left this month."""
+    try:
+        voices = check_voices(get_public_clinics())
+    except VoiceConfigError as err:
+        console.print(f"[red]{escape(str(err))}[/red]")
+        raise typer.Exit(code=1)
+    if not asyncio.run(_tts_check(voices)):
+        raise typer.Exit(code=1)
+
+
+def _fixed_lana_lines() -> list[str]:
+    """Lines Lana says on every run: disclosure, greeting, the 6 intake questions, the hold request."""
+    _, lines = intake_prompts()
+    agent_name = get_settings().agent_name
+    return [
+        DISCLOSURE.format(agent_name=agent_name),
+        lines["greeting"].format(agent_name=agent_name),
+        *(lines[topic] for topic in TOPIC_FIELDS),
+        HOLD_REQUEST,
+    ]
+
+
+@app.command("tts-prewarm")
+def tts_prewarm() -> None:
+    """Cache Lana's fixed lines so demo runs spend no credits on them."""
+    voice_id = _voice_by_name("lana")
+    texts = _fixed_lana_lines()
+    results = asyncio.run(prewarm([(t, voice_id) for t in texts], Speaker.AGENT))
+    for text, result in zip(texts, results):
+        style = {"cached": "dim", "generated": "green", "failed": "red"}[result]
+        console.print(f"[{style}]{result:>9}[/{style}]  {escape(text)}")
+    sent = sum(len(t) for t, r in zip(texts, results) if r == "generated")
+    console.print(f"{results.count('generated')} generated ({sent} characters), {results.count('cached')} already cached.")
+    if "failed" in results:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":
