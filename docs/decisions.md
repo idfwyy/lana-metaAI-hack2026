@@ -2,6 +2,36 @@
 
 Newest first.
 
+## 2026-10-31: Muse Voice Transcribe, streaming STT in Endpointing mode (voice/stt.py)
+
+Sources: Meta Model API docs: Speech to text guide, https://dev.meta.ai/docs/speech-to-text; Realtime reference, https://dev.meta.ai/docs/api-reference/voice/realtime; File transcription, https://dev.meta.ai/docs/api-reference/voice/transcribe; Schemas, https://dev.meta.ai/docs/api-reference/voice/schemas.
+
+- **Auth on the WebSocket:** the HTTP `Authorization` header is ignored. The key goes in the handshake, which must be the first JSON text frame and must arrive within 10 s of connecting: `{"authorization": {"accessToken": "Bearer <key>"}, "audioEncoding": "PCM_24KHZ", "model": "<MODEL_STT>", "mode": "ENDPOINTING", "partialMode": "CUMULATIVE", "emitAudioProgress": true}`. The ack is the only server frame with no `type`, and it carries `sessionId`. An optional `?sessionId=` query parameter sets the ID used in Meta's logs; we send `stream-<uuid>`.
+- **Audio format:** raw signed 16-bit little-endian mono PCM in binary frames (no base64). The encoding is `PCM_24KHZ` (native, preferred, 48,000 bytes/s) or `PCM_16KHZ` (resampled on Meta's side). There is no required chunk size; Meta's example sends 80 ms frames at real time. We use 24 kHz in 100 ms chunks (4,800 bytes): `stt.AUDIO_FORMAT` and `stt.CHUNK_MS`, which the browser and the tests use too.
+- **Modes**, set by `mode` in the handshake. A session's mode can't change once it starts.
+  - `PUSH_TO_TALK` (default): one turn, and the client marks the end, for example with a mic button. Completion is `transcript` with `final: true`.
+  - `ENDPOINTING`: Meta detects turn boundaries, one turn per speech segment. Completion is `speechComplete` per `turnId`. **We use this one.** The docs give no silence threshold or sensitivity setting.
+  - `DIARIZATION`: endpointing plus `speaker` events with session-scoped labels (`A`, `B`). The docs say it is "not tuned for low-latency voice commands". It could suit phone audio later, but not live turns.
+- **Server events** (dispatch on `type` and ignore unknown types):
+  - `speechStart {turnId}`.
+  - `transcript {transcript, final}`: partials have `final: false` and no `turnId`, and belong to the latest `speechStart`. In CUMULATIVE mode each partial is the full hypothesis so far.
+  - `speechEnd {turnId}`: a boundary only, no text.
+  - `speechComplete {turnId, transcript}`: the post-processed text of the turn. It can differ from the last partial; in our test the partial "Under 5,000 and I need evenings" came back with a period added.
+  - `audioProgress {audioProcessedMs}`, `error {message, sessionId}` (sent before a fatal close), and `speaker` (Diarization only).
+- **Our mapping:** partial `transcript` → `Partial`; `speechComplete` → `Final` then `EndOfTurn`. `EndOfTurn` comes after `Final`, so the consumer has the text when it acts. Meta sends `speechEnd` and `speechComplete` together (same millisecond in our runs).
+- **Ending a session:** send `{"type": "endStream"}`, then keep reading until Meta closes with 1000. Closing early can drop pending events. After endStream, Meta also sends `transcript` with `final: true` and empty text; we ignore it.
+- **Close codes:** 1000 normal; 1008 invalid request or pacing problem (more than 5 s backlog, or audio arriving slower than real time); 1011 backend failure, including "Max session duration reached"; 1013 rate limited.
+- **Limits:** 60-minute sessions with no resume token; handshake within 10 s; no more than 5 s of audio queued ahead of processing; idle input without endStream gets closed; 256 concurrent streams and 16,000 per hour, shared with the file endpoint.
+- **File endpoint:** `POST {META_BASE_URL}/asr/transcribe` with `Authorization: Bearer`. The body is multipart with a `request` JSON part (`{"model", "audioEncoding": "WAV", "mode"}`) and an `audio` part holding a mono 16-bit PCM WAV at 16 or 24 kHz. The response is `{sessionId, transcript, audioDurationMs, turns}`. Limits are 32 MB (413) and 10 minutes (400); 429 means rate limited. `transcribe_file` uses `PUSH_TO_TALK`, so the whole clip is one turn.
+- **End of turn comes from Meta.** In `hello.wav` the speech ends at about 4.5 s. Meta put `speechEnd` at about 4,540 to 4,620 ms and usually sent `speechEnd` and the final text once it had processed about 5,040 to 5,120 ms, which is 540 to 620 ms after speech stopped. On the wall clock that was about 0.72 to 0.79 s after our last voiced chunk went out. In some runs it took longer than 700 ms, and Meta's partials can trail its `audioProcessedMs`. Connect (handshake ack) took 0.8 to 1.2 s; the first partial came 0.7 to 0.8 s after the first audio.
+- **Silence fallback, never racing Meta** (chosen after a strict 700 ms rule cut "...and I need" before "evenings" in one run):
+  - **700 ms** only for a turn Meta never opened with `speechStart`, meaning its endpointing isn't working.
+  - **2 s safety net** for a turn Meta opened but never ended with `speechEnd`.
+  - Silence is measured against Meta's `audioProcessedMs`, from the end of our last voiced chunk (RMS of at least 500 out of 32,767), and only while there is partial text. After `speechEnd` we wait for `speechComplete`.
+  - After a fallback, later partials and `speechComplete` for that turn are ignored, so there is never a second `Final`.
+  - A turn still open when the session ends (after endStream) is also sent as `Final`, marked as a fallback.
+- **Reconnect:** one reconnect per session, for a failed first connect or any drop (any close other than a 1000 after endStream). The new session starts fresh, and a partial from the old session is logged and dropped. A second failure raises `STTUnavailable`, and the UI should switch to tap buttons. We also retry once on 1008, though Meta says that one fails again.
+
 ## 2026-10-31: TTS model per speaker, and a reworded disclosure
 
 - Lana uses `eleven_v4_turbo` (`ELEVENLABS_MODEL_AGENT`) with a `[warmly]` audio tag (`ELEVENLABS_TAG_AGENT`) in front of each line for a more natural, expressive voice. The tag is sent only when her model supports audio tags and is never shown on screen.

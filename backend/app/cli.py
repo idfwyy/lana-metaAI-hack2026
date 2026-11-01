@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
+import sys
 import time
+import wave
 
 import json
 from datetime import datetime
@@ -40,6 +42,17 @@ from app.schemas.events import (
 )
 from app.schemas.preferences import Preferences
 from app.schemas.quote import Quote
+from app.voice.stt import (
+    AUDIO_FORMAT,
+    CHUNK_MS,
+    EndOfTurn,
+    Final,
+    Partial,
+    StreamingSTT,
+    STTStats,
+    STTUnavailable,
+    transcribe_file,
+)
 from app.voice.tts import (
     VoiceConfigError,
     check_voices,
@@ -552,6 +565,122 @@ def tts_prewarm() -> None:
     console.print(f"{results.count('generated')} generated ({sent} characters), {results.count('cached')} already cached.")
     if "failed" in results:
         raise typer.Exit(code=1)
+
+
+def _read_pcm(path: Path) -> bytes:
+    """The PCM frames of a WAV already in AUDIO_FORMAT. Exits with the ffmpeg fix if it isn't."""
+    with wave.open(str(path), "rb") as w:
+        got = (w.getframerate(), w.getsampwidth(), w.getnchannels())
+        want = (AUDIO_FORMAT.sample_rate, AUDIO_FORMAT.sample_bytes, AUDIO_FORMAT.channels)
+        if got != want:
+            console.print(
+                f"[red]{path} is {got[0]} Hz, {got[1] * 8}-bit, {got[2]} channel(s). STT needs "
+                f"{want[0]} Hz, 16-bit, mono. Convert with: ffmpeg -i in -ac 1 -ar {want[0]} "
+                "-c:a pcm_s16le out.wav[/red]"
+            )
+            raise typer.Exit(code=1)
+        return w.readframes(w.getnframes())
+
+
+def _partial_line(text: str) -> None:
+    """Rewrite the current terminal line with the latest partial."""
+    width = max(console.width - 12, 20)
+    shown = text if len(text) <= width else "..." + text[-(width - 3):]
+    sys.stdout.write(f"\r\x1b[2K  partial: {shown}")
+    sys.stdout.flush()
+
+
+async def _listen(pcm: bytes) -> tuple[list[str], STTStats]:
+    """Stream PCM in CHUNK_MS chunks at real time and print events. Returns the final texts."""
+    finals: list[str] = []
+    step = AUDIO_FORMAT.chunk_bytes(CHUNK_MS)
+    async with StreamingSTT() as stt:
+
+        async def send() -> None:
+            started = time.perf_counter()
+            for i, start in enumerate(range(0, len(pcm), step)):
+                await stt.send_audio(pcm[start:start + step])
+                # Pace to the clock, not per sleep, so drift doesn't add up.
+                await asyncio.sleep(max(0.0, started + (i + 1) * CHUNK_MS / 1000 - time.perf_counter()))
+            await stt.finish()
+
+        sender = asyncio.create_task(send())
+        try:
+            async for event in stt:
+                if isinstance(event, Partial):
+                    _partial_line(event.text)
+                elif isinstance(event, Final):
+                    sys.stdout.write("\r\x1b[2K")
+                    console.print(f"[bold]Final:[/bold] {escape(event.text)}")
+                    finals.append(event.text)
+                elif isinstance(event, EndOfTurn):
+                    source = "our 700 ms silence fallback" if event.fallback else "Meta endpointing"
+                    console.print(f"[bold]End of turn[/bold] [dim]({source})[/dim]")
+        finally:
+            if not sender.done():
+                sender.cancel()
+        await asyncio.gather(sender, return_exceptions=True)
+    return finals, stt.stats
+
+
+def _print_stt_stats(stats: STTStats) -> None:
+    def ms(value: float | None) -> str:
+        return f"{value:.0f} ms" if value is not None else "n/a"
+
+    console.print("\n[bold]Latency[/bold]")
+    console.print(f"  connect:                {ms(stats.connect_ms)}")
+    console.print(f"  first partial:          {ms(stats.first_partial_ms)} after the first audio")
+    finals = ", ".join(ms(v) for v in stats.speech_end_to_final_ms) or "n/a"
+    console.print(f"  end of speech to final: {finals}")
+    console.print(f"  audio sent:             {stats.audio_seconds_sent:.1f} s")
+
+
+def _run_listen(path: Path) -> list[str]:
+    pcm = _read_pcm(path)
+    try:
+        finals, stats = asyncio.run(_listen(pcm))
+    except STTUnavailable as err:
+        console.print(f"\n[red]STT unavailable: {escape(str(err))}. The app would show tap buttons.[/red]")
+        raise typer.Exit(code=1)
+    _print_stt_stats(stats)
+    return finals
+
+
+@app.command()
+def listen(path: Path = typer.Argument(..., exists=True, dir_okay=False, help="WAV in the STT format")) -> None:
+    """Stream a WAV to Muse Voice Transcribe in real time; print partials, finals, end of turn and latency."""
+    if not _run_listen(path):
+        console.print("[yellow]No final text.[/yellow]")
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def transcribe(path: Path = typer.Argument(..., exists=True, dir_okay=False, help="Mono 16-bit WAV")) -> None:
+    """Transcribe a WAV with the file endpoint and print the text."""
+    started = time.perf_counter()
+    try:
+        text = asyncio.run(transcribe_file(path))
+    except Exception as err:
+        console.print(f"[red]{type(err).__name__}: {escape(str(err))}[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"{escape(text)}\n[dim]{time.perf_counter() - started:.2f}s[/dim]")
+
+
+@app.command("listen-intake")
+def listen_intake(path: Path = typer.Argument(..., exists=True, dir_okay=False, help="WAV in the STT format")) -> None:
+    """Stream a WAV through STT, then pass the final text to Intake.hear() and print what it filled."""
+    finals = _run_listen(path)
+    if not finals:
+        console.print("[yellow]No final text, nothing to hear.[/yellow]")
+        raise typer.Exit(code=1)
+    text = " ".join(finals)
+    console.print(f"\n[bold]Heard:[/bold] {escape(text)}")
+    intake = Intake()
+    turn = asyncio.run(intake.hear(text))
+    console.print(f"[bold]Filled:[/bold] {', '.join(turn.filled) or 'nothing'}")
+    console.print("[bold]Draft:[/bold]")
+    console.print_json(intake.draft.model_dump_json())
+    _print_lana(turn.spoken)
 
 
 if __name__ == "__main__":
