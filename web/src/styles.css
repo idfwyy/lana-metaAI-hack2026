@@ -1,0 +1,161 @@
+@import "tailwindcss";
+
+/* Design tokens. Tailwind v4 turns --color-* into bg-/text-/border- utilities. */
+@theme {
+  --color-paper: #f7f5f0;
+  --color-surface: #ffffff;
+  --color-ink: #12201c;
+  --color-muted: #5e6b66;
+  --color-hairline: #e4e1d9;
+  --color-primary: #0f5c55;
+  --color-primary-press: #0b4a44;
+  --color-primary-soft: #e3efec;
+  --color-accent: #ff8a4c;
+  --color-accent-soft: #ffe6d8;
+
+  --radius-card: 20px;
+  --radius-inner: 16px;
+  --radius-pill: 999px;
+
+  --shadow-soft: 0 1px 2px rgb(18 32 28 / 0.04), 0 12px 32px -16px rgb(18 32 28 / 0.1);
+
+  --font-serif: "Instrument Serif", ui-serif, Georgia, serif;
+  --font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+::selection {
+  background: var(--color-primary-soft);
+  color: var(--color-ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Press feedback for anything clickable. */
+.pressable {
+  transition: transform 140ms var(--ease-out), background-color 160ms ease, color 160ms ease,
+    border-color 160ms ease;
+}
+.pressable:active {
+  transform: scale(0.97);
+}
+
+.speaker-label {
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+/* The mic's breathing halo. Slow and soft: it is the only idle motion on Home. */
+@keyframes halo-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  50% {
+    transform: scale(1.12);
+    opacity: 0.9;
+  }
+}
+.halo-ring {
+  animation: halo-breathe 4.8s ease-in-out infinite;
+}
+.halo-ring.delay {
+  animation-delay: -2.4s;
+}
+
+/* Thin ring that traces the mic edge while the case is being created. */
+@keyframes trace {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.trace-ring {
+  animation: trace 900ms linear infinite;
+}
+
+/* Live and recording indicator. */
+@keyframes live-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.7;
+  }
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+.live-dot {
+  position: relative;
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--color-accent);
+  flex-shrink: 0;
+}
+.live-dot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--color-accent);
+  animation: live-pulse 1.6s var(--ease-out) infinite;
+}
+
+/* Words in a line fade in as the audio reaches them. */
+.word {
+  transition: opacity 120ms ease;
+}
+
+.scroll-quiet {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-hairline) transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .halo-ring,
+  .trace-ring {
+    animation: none;
+  }
+  .live-dot::after {
+    animation: none;
+    opacity: 0;
+  }
+  .pressable:active {
+    transform: none;
+  }
+}

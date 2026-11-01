@@ -1,0 +1,96 @@
+import { useState } from "react";
+import { AnimatePresence, motion } from "motion/react";
+import { ChevronDown } from "lucide-react";
+import { EASE_DRAWER } from "../lib/motion";
+
+export const DISCLAIMER =
+  "Quick heads-up: this is a live demo. To respect real clinics' time, I won't call real offices during judging. I'll call demo clinics instead. Each one is its own AI receptionist with hidden prices and limits, so I really do have to negotiate. Every call starts with me saying I'm an AI, and your voice is only used for this session.";
+
+interface Props {
+  voice: boolean;
+  setVoice: (v: boolean) => void;
+  clinics: 2 | 3;
+  setClinics: (n: 2 | 3) => void;
+}
+
+export function DemoFooter({ voice, setVoice, clinics, setClinics }: Props) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <footer className="border-t border-hairline px-4 py-4 sm:px-8">
+      <div className="mx-auto flex max-w-[1120px] flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          aria-expanded={open}
+          aria-controls="about-demo"
+          className="pressable inline-flex items-center gap-1.5 rounded-md text-[13px] text-muted hover:text-ink"
+        >
+          About this demo
+          <ChevronDown
+            size={14}
+            aria-hidden
+            className="transition-transform duration-200 ease-[var(--ease-out)]"
+            style={{ transform: open ? "rotate(180deg)" : "none" }}
+          />
+        </button>
+
+        <div className="flex items-center gap-5 text-[13px] text-muted">
+          <label className="inline-flex cursor-pointer items-center gap-2">
+            Voice
+            <button
+              type="button"
+              role="switch"
+              aria-checked={voice}
+              onClick={() => setVoice(!voice)}
+              className={`relative h-5 w-9 rounded-full transition-colors duration-200 ${voice ? "bg-primary" : "bg-hairline"}`}
+            >
+              <span
+                className="absolute left-0.5 top-0.5 size-4 rounded-full bg-surface shadow-sm transition-transform duration-200 ease-[var(--ease-out)]"
+                style={{ transform: voice ? "translateX(16px)" : "none" }}
+              />
+            </button>
+            <span className="w-6 text-ink">{voice ? "on" : "off"}</span>
+          </label>
+
+          <div className="inline-flex items-center gap-2">
+            <span id="clinics-label">Clinics</span>
+            <div role="radiogroup" aria-labelledby="clinics-label" className="inline-flex rounded-full border border-hairline p-0.5">
+              {([2, 3] as const).map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  role="radio"
+                  aria-checked={clinics === n}
+                  onClick={() => setClinics(n)}
+                  className={`h-6 w-8 rounded-full font-mono text-[12px] transition-colors duration-150 ${
+                    clinics === n ? "bg-primary-soft text-primary" : "text-muted hover:text-ink"
+                  }`}
+                >
+                  {n}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <AnimatePresence initial={false}>
+        {open && (
+          <motion.div
+            id="about-demo"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.26, ease: EASE_DRAWER }}
+            className="overflow-hidden"
+          >
+            <p className="mx-auto max-w-[1120px] pt-3 text-[14px] leading-[1.6] text-muted">
+              <span className="block max-w-[64ch]">{DISCLAIMER}</span>
+            </p>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </footer>
+  );
+}
