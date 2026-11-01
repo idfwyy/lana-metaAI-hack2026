@@ -1,6 +1,7 @@
 """Typer commands to test each piece in the terminal."""
 
 import asyncio
+import base64
 import logging
 import sys
 import time
@@ -10,11 +11,13 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 import typer
 from elevenlabs import AsyncElevenLabs
 from elevenlabs.core.api_error import ApiError
 from rich.console import Console
 from rich.markup import escape
+from websockets.asyncio.client import connect as ws_connect
 
 from app.agent.caller import DISCLOSURE, HOLD_REQUEST, Caller
 from app.agent.extractor import CHECKLIST_ORDER, build_quote
@@ -35,6 +38,7 @@ from app.schemas.events import (
     CaseStatusEvent,
     ConcessionWon,
     ErrorEvent,
+    EventAdapter,
     LogLine,
     OffersReady,
     QuoteUpdated,
@@ -681,6 +685,68 @@ def listen_intake(path: Path = typer.Argument(..., exists=True, dir_okay=False, 
     console.print("[bold]Draft:[/bold]")
     console.print_json(intake.draft.model_dump_json())
     _print_lana(turn.spoken)
+
+
+async def _ws_watch(url: str, voice: bool, clinics: int) -> bool:
+    """Create and start a watch case on a running server and print its events. False on an error."""
+    async with httpx.AsyncClient(base_url=url, timeout=10) as http:
+        response = await http.post("/cases", json={"mode": "watch", "voice": voice, "clinics": clinics})
+    if response.status_code != 200:
+        console.print(f"[red]POST /cases failed: HTTP {response.status_code}: {escape(response.text)}[/red]")
+        return False
+    case_id = response.json()["case_id"]
+    console.print(f"Case {case_id} (voice {'on' if voice else 'off'}, {clinics} clinics)")
+
+    printer = _EventPrinter()
+    audio: dict[int, list[int]] = {}  # line_seq -> chunk sizes
+    last_seq = 0
+    ws_url = url.replace("http", "ws", 1).rstrip("/") + f"/ws/case/{case_id}"
+    async with ws_connect(ws_url, max_size=None) as ws:
+        await ws.send(json.dumps({"type": "start"}))
+        async for raw in ws:
+            msg = json.loads(raw)
+            seq = msg.get("seq", 0)
+            if seq <= last_seq:
+                console.print(f"[yellow]  seq {seq} arrived after {last_seq}[/yellow]")
+            last_seq = max(last_seq, seq)
+
+            if msg["type"] == "audio":
+                sizes = audio.setdefault(msg["line_seq"], [])
+                if msg.get("chunk_b64"):
+                    sizes.append(len(base64.b64decode(msg["chunk_b64"])))
+                if msg["last"]:
+                    who = "lana" if msg["speaker"] == Speaker.AGENT else msg["speaker"]
+                    detail = "failed" if msg.get("failed") else f"{len(sizes)} chunks, {sum(sizes):,} bytes"
+                    console.print(f"[dim]  audio {who}: {detail}[/dim]")
+                continue
+            if msg["type"] == "error" and "code" in msg:
+                console.print(f"[red]Error ({msg['code']}): {escape(msg['message'])}[/red]")
+                return False
+
+            event = EventAdapter.validate_python(msg)
+            printer(event)
+            if isinstance(event, ErrorEvent) and not event.recoverable:
+                return False
+            if isinstance(event, CaseStatusEvent) and event.status in (CaseStatus.OFFERS_READY, CaseStatus.ERROR):
+                return event.status == CaseStatus.OFFERS_READY
+    console.print("[red]The server closed the socket before the case finished.[/red]")
+    return False
+
+
+@app.command("ws-watch")
+def ws_watch(
+    no_voice: bool = typer.Option(False, "--no-voice", help="Text only; audio events are failed markers"),
+    clinics: int = typer.Option(2, "--clinics", min=2, max=3, help="How many clinics to call"),
+    url: str = typer.Option("http://localhost:8000", "--url", help="Running server"),
+) -> None:
+    """Create a watch case on a running server, start it, and print its events in order."""
+    try:
+        ok = asyncio.run(_ws_watch(url, not no_voice, clinics))
+    except (OSError, httpx.HTTPError) as err:
+        console.print(f"[red]Could not reach {url}: {escape(str(err))}. Is uvicorn running?[/red]")
+        raise typer.Exit(code=1)
+    if not ok:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

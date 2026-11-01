@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
+from app import guard
 from app.config import get_settings
 
 log = logging.getLogger(__name__)
@@ -123,6 +124,7 @@ def _log_call(model: str, started: float, usage: object | None) -> None:
 async def _complete(
     prompt: str, model: str, images: list[bytes] | None, reasoning: str | None
 ) -> str:
+    guard.charge_llm()
     started = time.perf_counter()
     response = await get_client().chat.completions.create(
         model=model, messages=[_user_message(prompt, images)], **_reasoning_kwargs(reasoning)
@@ -167,6 +169,7 @@ async def stream_chat(
     """Yield text chunks as they arrive, so text-to-speech can start early."""
     if not model:
         raise ValueError("model is empty; set MODEL_FAST / MODEL_SMART in .env")
+    guard.charge_llm()
     started = time.perf_counter()
     usage = None
     stream = await get_client().chat.completions.create(

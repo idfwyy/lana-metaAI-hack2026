@@ -82,6 +82,13 @@ class Settings(BaseSettings):
     web_origin: str = "http://localhost:5173"
     public_base_url: str = ""
 
+    # Demo usage limits (app/guard.py). TTS characters count only what is sent to ElevenLabs.
+    max_runs_per_case: int = Field(default=2, ge=1)
+    max_cases_per_ip_hour: int = Field(default=5, ge=1)
+    max_llm_calls_per_case: int = Field(default=60, ge=1)
+    max_tts_chars_per_case: int = Field(default=4000, ge=0)
+    max_tts_chars_per_day: int = Field(default=30000, ge=0)
+
     # Safety switches
     enable_real_calls: bool = False
     allowed_call_numbers: str = Field(default="", description="Comma-separated E.164 numbers")

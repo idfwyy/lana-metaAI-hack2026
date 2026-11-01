@@ -17,6 +17,7 @@ from pathlib import Path
 
 from elevenlabs import AsyncElevenLabs, VoiceSettings
 
+from app import guard
 from app.config import get_settings
 from app.schemas.clinic import Clinic
 from app.schemas.enums import Speaker
@@ -157,6 +158,8 @@ async def stream_speech(
     On any failure or a stall longer than TIMEOUT_SECONDS it logs and stops. If that
     happens before the first chunk the caller gets no audio and shows the text only.
     Only a fully received line is written to the cache.
+
+    The one exception it raises: guard.LimitHit, when a case run is over its TTS character limit.
     """
     if not voice_id:
         return
@@ -170,6 +173,7 @@ async def stream_speech(
                 yield chunk
         return
 
+    guard.charge_tts(len(text))  # only cache misses cost credits
     log.info(
         "tts cache miss: sending %d chars to ElevenLabs (%s, voice %s, stability %s)",
         len(text), model, voice_id, vs.stability,
@@ -221,6 +225,41 @@ async def stream_speech(
         "tts done in %.1fs (first chunk %.2fs): %d chars, %d bytes",
         time.perf_counter() - started, first_chunk_s, len(text), sum(map(len, parts)),
     )
+
+
+WARM_UP_TEXT = "Hi."
+
+
+async def _warm_one(voice_id: str, speaker: Speaker) -> bool:
+    stream = None
+    try:
+        stream = _client().text_to_speech.stream(
+            voice_id,
+            text=WARM_UP_TEXT,
+            model_id=model_for(speaker),
+            voice_settings=voice_settings(),
+            output_format=OUTPUT_FORMAT,
+            request_options={"timeout_in_seconds": TIMEOUT_SECONDS, "max_retries": 0},
+        )
+        await asyncio.wait_for(anext(stream), TIMEOUT_SECONDS)
+        return True
+    except Exception as err:
+        log.warning("tts warm-up failed for voice %s: %s: %s", voice_id, type(err).__name__, err)
+        return False
+    finally:
+        if stream is not None:
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+
+
+async def warm_up(voices: list[tuple[str, Speaker]]) -> list[bool]:
+    """One tiny request per (voice_id, speaker), all at once, so the first real line isn't a cold start.
+
+    Not cached and not counted against any limit. Never raises; returns True per voice that answered.
+    """
+    return list(await asyncio.gather(*(_warm_one(voice_id, speaker) for voice_id, speaker in voices)))
 
 
 async def prewarm(lines: list[tuple[str, str]], speaker: Speaker = Speaker.AGENT) -> list[str]:
