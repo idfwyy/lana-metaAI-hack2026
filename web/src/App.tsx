@@ -1,5 +1,6 @@
 // Switches between Home, Working and Done. The mic on Home and the orb in the top bar share
 // a layoutId inside one LayoutGroup, so starting a case morphs one into the other.
+// A patient case stays on Home while Lana listens, and moves on when its Watch run starts.
 
 import { useState } from "react";
 import { AnimatePresence, LayoutGroup, MotionConfig, motion } from "motion/react";
@@ -8,6 +9,7 @@ import { TopBar } from "./components/TopBar";
 import { createCase } from "./lib/api";
 import { unlockAudio } from "./lib/audio";
 import { useStoredState } from "./lib/hooks";
+import { startMic } from "./lib/mic";
 import { EASE_OUT } from "./lib/motion";
 import { isLive, statusLine } from "./lib/state";
 import { useCaseRun } from "./lib/useCaseRun";
@@ -22,7 +24,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [voice, setVoice] = useStoredState("lana.voice", true);
   const [clinics, setClinics] = useStoredState<2 | 3>("lana.clinics", 2);
-  const { state, start, stop } = useCaseRun();
+  const { state, listen, start, listenTo, sendText, sendAudio, micLevel, stop } = useCaseRun(startOver);
 
   async function startWatch() {
     if (busy) return;
@@ -39,6 +41,24 @@ export default function App() {
     }
   }
 
+  async function startPatient() {
+    if (busy) return;
+    unlockAudio(); // must run inside the click
+    setBusy(true);
+    // Ask for the mic while the case is created; a refusal just means the tap and type fallback.
+    const mic = startMic(sendAudio);
+    try {
+      const id = await createCase("patient", voice, clinics);
+      listenTo(id, mic);
+      setRunning(true);
+    } catch (err) {
+      void mic.then((m) => m.stop(), () => {});
+      toast.error(err instanceof Error ? err.message : "Couldn't start. Try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function startOver() {
     stop();
     setRunning(false);
@@ -46,7 +66,10 @@ export default function App() {
 
   const failed = state.error !== null || state.caseStatus === "error";
   const done = state.offers !== null && state.caseStatus === "offers_ready";
-  const view: View = !running ? "home" : failed ? "error" : done ? "done" : "working";
+  // Intake: Lana is talking with the patient on Home; no run has started yet.
+  const intake = running && listen.active && state.caseStatus === null;
+  const view: View = !running ? "home" : failed ? "error" : intake ? "home" : done ? "done" : "working";
+  const lana = [...state.lines].reverse().find((l) => l.callId === null) ?? null;
 
   return (
     <MotionConfig reducedMotion="user">
@@ -58,7 +81,12 @@ export default function App() {
               <Home
                 key="home"
                 busy={busy}
+                onMic={startPatient}
                 onStart={startWatch}
+                listen={listen}
+                lana={lana}
+                onSay={sendText}
+                micLevel={micLevel}
                 voice={voice}
                 setVoice={setVoice}
                 clinics={clinics}

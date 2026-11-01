@@ -22,6 +22,8 @@ interface LineAudio {
 export interface PlayerHandlers {
   apply: (event: ServerEvent) => void;
   reveal: (seq: number, count: number) => void;
+  /** Lana's line starts (true) or ends (false), so the mic can mute and she never hears herself. */
+  speaking?: (on: boolean) => void;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -62,6 +64,7 @@ export class Player {
     this.current?.stop();
     this.current = null;
     stopAllAudio();
+    this.handlers.speaking?.(false);
   }
 
   private storeFrame(f: AudioFrame): void {
@@ -113,6 +116,16 @@ export class Player {
   }
 
   private async playOne(line: LineEvent, gen: number): Promise<void> {
+    const lana = line.type === "agent_said" || line.speaker === "agent";
+    if (lana) this.handlers.speaking?.(true);
+    try {
+      await this.playLineOnce(line, gen);
+    } finally {
+      if (lana && gen === this.gen) this.handlers.speaking?.(false);
+    }
+  }
+
+  private async playLineOnce(line: LineEvent, gen: number): Promise<void> {
     const seq = line.seq!;
     const words = line.text.split(/\s+/).filter(Boolean).length;
     this.handlers.apply(line);

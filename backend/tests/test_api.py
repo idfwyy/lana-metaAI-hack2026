@@ -1,22 +1,29 @@
-"""main.py, audio_bus.py and guard.py through FastAPI's TestClient. Orchestrator and TTS mocked; no network."""
+"""main.py, audio_bus.py and guard.py through FastAPI's TestClient. Orchestrator, TTS, STT and the LLM mocked; no network."""
 
 import asyncio
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app import guard, main
+from app.agent import commands as commands_module
+from app.agent import intake as intake_module
+from app.agent.intake import Intake
 from app.config import get_settings
 from app.db.store import store
 from app.integrations import meta_llm
 from app.schemas.enums import CallStatus, CaseStatus, Speaker
 from app.schemas.events import CallStatusEvent, CaseStatusEvent, LogLine, TranscriptFinal
 from app.voice import audio_bus, tts
+from app.voice.stt import AUDIO_FORMAT, CHUNK_MS, Final, Partial, STTUnavailable
 
 TAGGED_LINE = "[warmly] Hi there! This is Lana. [laughs]"
 SHOWN_LINE = "Hi there! This is Lana."
 CLINIC_LINE = "Thanks for calling Parkway, how can I help?"
+
+LOUD = (8000).to_bytes(2, "little", signed=True) * (AUDIO_FORMAT.chunk_bytes(CHUNK_MS) // 2)
 
 
 def _script(case_id: str) -> list:
@@ -41,6 +48,41 @@ class World:
         self.spoken: list[tuple[str, str, Speaker]] = []
         self.chunks: list[bytes] = [b"aaa", b"bbb", b"ccc"]
         self.tts_error: Exception | None = None
+        # STT: what the fake stream yields after its first voiced chunk, and every chunk sent.
+        self.stt_script: list = []
+        self.stt_error: Exception | None = None
+        self.stt_sent: list[bytes] = []
+        self.heard: list[dict] = []  # intake's call_json replies
+        self.classified: list[str] = []  # texts the command classifier saw
+
+
+class FakeSTT:
+    def __init__(self, world: "World") -> None:
+        self.world = world
+        self.events: asyncio.Queue = asyncio.Queue()
+
+    async def __aenter__(self) -> "FakeSTT":
+        if self.world.stt_error is not None:
+            raise self.world.stt_error
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        self.events.put_nowait(None)
+
+    def __aiter__(self) -> "FakeSTT":
+        return self
+
+    async def __anext__(self):
+        item = await self.events.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+    async def send_audio(self, chunk: bytes) -> None:
+        self.world.stt_sent.append(chunk)
+        if any(chunk):
+            while self.world.stt_script:
+                self.events.put_nowait(self.world.stt_script.pop(0))
 
 
 @pytest.fixture
@@ -76,6 +118,13 @@ def world(monkeypatch) -> World:
     async def no_warm_up() -> None:
         return None
 
+    async def fake_intake_json(prompt, schema, model, images=None, reasoning=None):
+        return schema.model_validate(w.heard.pop(0) if w.heard else {})
+
+    async def fake_classifier(prompt, schema, model, images=None, reasoning=None):
+        w.classified.append(prompt)
+        return schema.model_validate({"command": None})
+
     settings = get_settings()
     for name, value in {
         "voice_agent": "lana-voice",
@@ -87,6 +136,11 @@ def world(monkeypatch) -> World:
     monkeypatch.setattr(main, "Orchestrator", FakeOrchestrator)
     monkeypatch.setattr(main, "_warm_up_voices", no_warm_up)
     monkeypatch.setattr(main, "_open_clients", lambda: None)
+    monkeypatch.setattr(main, "_prewarm_lines", no_warm_up)
+    monkeypatch.setattr(main, "StreamingSTT", lambda: FakeSTT(w))
+    monkeypatch.setattr(main, "LINE_TAIL_S", 0)
+    monkeypatch.setattr(intake_module, "call_json", fake_intake_json)
+    monkeypatch.setattr(commands_module, "call_json", fake_classifier)
     monkeypatch.setattr(audio_bus, "stream_speech", fake_speech)
     store.clear()
     guard.reset()
@@ -146,11 +200,15 @@ def test_post_cases_returns_an_id(client) -> None:
     assert record is not None and record.voice is False and record.clinics == 3
 
 
-@pytest.mark.parametrize("mode", ["patient", "clinic"])
-def test_other_modes_are_not_built_yet(client, mode) -> None:
-    response = client.post("/cases", json={"mode": mode})
+def test_clinic_mode_is_not_built_yet(client) -> None:
+    response = client.post("/cases", json={"mode": "clinic"})
     assert response.status_code == 501
     assert "not built yet" in response.json()["detail"]
+
+
+def test_patient_case_starts_without_preferences(client) -> None:
+    case_id = _new_case(client, mode="patient")
+    assert store.get(case_id).case.preferences is None
 
 
 def test_new_cases_per_ip_are_limited(client) -> None:
@@ -354,3 +412,174 @@ async def test_llm_counter_stops_at_the_limit(monkeypatch) -> None:
         with pytest.raises(guard.LimitHit):
             await meta_llm._complete("p", "m", None, None)
     assert usage.llm_calls == 3 and usage.hit == "llm" and cancelled == [True]
+
+
+def test_stt_counter_stops_at_the_limit(monkeypatch) -> None:
+    monkeypatch.setattr(get_settings(), "max_stt_seconds_per_case", 1)
+    guard.charge_stt(10**6)  # no case: never limited
+
+    usage = guard.CaseUsage("c1")
+    with guard.case_usage(usage):
+        for _ in range(10):
+            guard.charge_stt(0.1)
+        with pytest.raises(guard.LimitHit):
+            guard.charge_stt(0.1)
+    assert usage.hit == "stt" and usage.stt_seconds == pytest.approx(1.0)
+
+
+# ---------- the patient's voice session ----------
+
+
+def _until(ws, done) -> list[dict]:
+    """Messages up to and including the first one `done` accepts."""
+    messages = []
+    while True:
+        msg = ws.receive_json()
+        messages.append(msg)
+        if done(msg):
+            return messages
+
+
+def _wait_for(condition, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.02)
+
+
+def _listen(client: TestClient):
+    return client.websocket_connect(f"/ws/case/{_new_case(client, mode='patient')}")
+
+
+def _greeted(ws) -> list[dict]:
+    """Send listen and read Lana's greeting through its last audio frame."""
+    ws.send_json({"type": "listen"})
+    return _until(ws, lambda m: m["type"] == "audio" and m["last"])
+
+
+def _question(topic: str) -> str:
+    return Intake()._lines[topic]
+
+
+def test_listen_greets_with_the_demo_heads_up(client, world) -> None:
+    with _listen(client) as ws:
+        messages = _greeted(ws)
+    greeting = messages[0]
+    assert greeting["type"] == "agent_said" and greeting["call_id"] is None
+    assert greeting["text"] == main._greeting()
+    assert "live demo" in greeting["text"] and "—" not in greeting["text"]
+    assert world.spoken[0][1] == "lana-voice"
+
+
+def test_binary_frames_reach_the_stt(client, world) -> None:
+    with _listen(client) as ws:
+        _greeted(ws)
+        ws.send_bytes(LOUD)
+        _wait_for(lambda: LOUD in world.stt_sent)
+
+
+def test_audio_during_lanas_line_is_replaced_with_silence(client, world, monkeypatch) -> None:
+    monkeypatch.setattr(main, "LINE_TAIL_S", 30)  # her greeting is still playing
+    with _listen(client) as ws:
+        _greeted(ws)
+        for _ in range(3):
+            ws.send_bytes(LOUD)
+        _wait_for(lambda: len(world.stt_sent) >= 3)
+    assert not any(any(chunk) for chunk in world.stt_sent)
+
+
+def test_a_final_transcript_runs_intake_and_lana_asks_the_next_question(client, world) -> None:
+    world.stt_script = [Partial("I want braces"), Final("I want braces near Dallas")]
+    world.heard = [{"treatment": "braces", "city": "Dallas"}]
+    with _listen(client) as ws:
+        _greeted(ws)
+        ws.send_bytes(LOUD)
+        messages = _until(ws, lambda m: m["type"] == "agent_said")
+
+    kinds = [m["type"] for m in messages]
+    assert kinds == ["user_partial", "user_said", "intake", "agent_said"]
+    assert messages[0]["text"] == "I want braces"
+    assert messages[1]["text"] == "I want braces near Dallas"
+    update = messages[2]
+    assert update["topic"] == "budget" and update["done"] is False
+    assert update["draft"] == {"treatment": "braces", "zip_code": "75201", "city": "Dallas"}
+    assert messages[3]["text"] == _question("budget")
+    assert [m["seq"] for m in messages] == sorted(m["seq"] for m in messages)
+
+
+def test_typed_text_takes_the_same_path(client, world) -> None:
+    world.heard = [{"treatment": "aligners"}]
+    with _listen(client) as ws:
+        _greeted(ws)
+        ws.send_json({"type": "user_text", "text": "Clear aligners"})
+        messages = _until(ws, lambda m: m["type"] == "agent_said")
+    assert [m["type"] for m in messages] == ["user_said", "intake", "agent_said"]
+    assert messages[2]["text"] == _question("location")
+
+
+def test_intake_done_sends_the_preferences(client, world) -> None:
+    world.heard = [{
+        "treatment": "braces", "city": "Dallas", "budget": "5000", "prefers_monthly": True,
+        "has_xrays": False, "has_plan": False, "must_haves": ["evening hours"],
+    }]
+    with _listen(client) as ws:
+        _greeted(ws)
+        ws.send_json({"type": "user_text", "text": "Braces near Dallas under 5k, monthly, evenings, no x-rays"})
+        messages = _until(ws, lambda m: m["type"] == "agent_said")
+    update = messages[1]
+    assert update["done"] is True and update["topic"] is None
+    assert update["preferences"]["budget_max"] == 5000
+    assert update["preferences"]["must_haves"] == ["evening hours"]
+    assert messages[2]["text"].startswith("Got it. Braces near Dallas, under $5,000")
+    assert store.get(update["case_id"]).case.preferences.zip_code == "75201"
+
+
+def test_saying_just_show_me_starts_the_watch_run(client, world) -> None:
+    world.stt_script = [Final("Just show me.")]
+    with _listen(client) as ws:
+        _greeted(ws)
+        ws.send_bytes(LOUD)
+        messages = _until(ws, lambda m: m["type"] == "case_status" and m["status"] == "offers_ready")
+    assert messages[0] == {**messages[0], "type": "user_said", "text": "Just show me."}
+    assert world.runs == 1
+    assert world.classified == []  # a keyword matched; no LLM
+
+
+def test_clinic_mode_is_coming_soon_and_start_over_resets(client, world) -> None:
+    with _listen(client) as ws:
+        _greeted(ws)
+        ws.send_json({"type": "user_text", "text": "I'll be the clinic"})
+        said = _until(ws, lambda m: m["type"] == "agent_said")
+        ws.send_json({"type": "user_text", "text": "Start over"})
+        reset = _until(ws, lambda m: m["type"] == "command")
+    assert said[-1]["text"] == main.COMING_SOON
+    assert reset[-1]["name"] == "start_over"
+    assert world.runs == 0
+
+
+def test_stt_failure_sends_stt_unavailable(client, world) -> None:
+    world.stt_error = STTUnavailable("Meta is down")
+    with _listen(client) as ws:
+        _greeted(ws)
+        ws.send_bytes(LOUD)
+        msg = ws.receive_json()
+        assert msg["type"] == "stt_unavailable"
+        # Typing still works.
+        world.heard = [{"treatment": "braces"}]
+        ws.send_json({"type": "user_text", "text": "Braces"})
+        messages = _until(ws, lambda m: m["type"] == "agent_said")
+    assert messages[-1]["text"] == _question("location")
+
+
+def test_stt_seconds_limit_stops_listening(client, world, monkeypatch) -> None:
+    monkeypatch.setattr(get_settings(), "max_stt_seconds_per_case", 1)
+    with _listen(client) as ws:
+        _greeted(ws)
+        ws.send_bytes(LOUD)  # then the pump keeps Meta fed with silence until the limit
+        msg = ws.receive_json()
+        assert msg == {**msg, "type": "error", "code": "limit", "message": guard.LIMIT_MESSAGE}
+        sent = len(world.stt_sent)
+        assert sent == 10  # 1 s of 100 ms chunks
+        ws.send_bytes(LOUD)
+        time.sleep(0.3)
+    assert len(world.stt_sent) == sent

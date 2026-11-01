@@ -82,12 +82,14 @@ class Settings(BaseSettings):
     web_origin: str = "http://localhost:5173"
     public_base_url: str = ""
 
-    # Demo usage limits (app/guard.py). TTS characters count only what is sent to ElevenLabs.
+    # Demo usage limits (app/guard.py). TTS characters count only what is sent to ElevenLabs;
+    # STT seconds count all audio sent to Meta, including the silence sent while Lana talks.
     max_runs_per_case: int = Field(default=2, ge=1)
     max_cases_per_ip_hour: int = Field(default=5, ge=1)
     max_llm_calls_per_case: int = Field(default=60, ge=1)
     max_tts_chars_per_case: int = Field(default=4000, ge=0)
     max_tts_chars_per_day: int = Field(default=30000, ge=0)
+    max_stt_seconds_per_case: int = Field(default=180, ge=1)
 
     # Safety switches
     enable_real_calls: bool = False

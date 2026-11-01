@@ -1,8 +1,8 @@
-"""Demo usage limits: runs per case, new cases per IP, LLM calls and TTS characters.
+"""Demo usage limits: runs per case, new cases per IP, LLM calls, TTS characters and STT seconds.
 
-The per-case counters live in a contextvar set by the server around a case run, so
-meta_llm.py and tts.py can charge them without knowing about cases. Outside a case
-(the CLI, tests) charging does nothing.
+The per-case counters live in a contextvar set by the server around a case run (and the
+patient's voice session), so meta_llm.py, tts.py and main.py can charge them without
+knowing about cases. Outside a case (the CLI, tests) charging does nothing.
 """
 
 import logging
@@ -31,7 +31,8 @@ class CaseUsage:
     case_id: str
     llm_calls: int = 0
     tts_chars: int = 0
-    hit: str | None = None  # "llm" or "tts" once a limit is reached
+    stt_seconds: float = 0.0  # audio sent to Meta STT, silence included
+    hit: str | None = None  # "llm", "tts" or "stt" once a limit is reached
     on_limit: Callable[[], object] | None = None  # cancels the run
 
 
@@ -58,7 +59,10 @@ def limit_hit() -> bool:
 
 def _hit(usage: CaseUsage, reason: str) -> None:
     usage.hit = reason
-    log.warning("case=%s hit the %s limit (llm calls %d, tts chars %d)", usage.case_id, reason, usage.llm_calls, usage.tts_chars)
+    log.warning(
+        "case=%s hit the %s limit (llm calls %d, tts chars %d, stt seconds %.1f)",
+        usage.case_id, reason, usage.llm_calls, usage.tts_chars, usage.stt_seconds,
+    )
     if usage.on_limit is not None:
         usage.on_limit()
     raise LimitHit(f"{reason} limit reached")
@@ -92,6 +96,16 @@ def charge_tts(chars: int) -> None:
         _hit(usage, "tts")
     usage.tts_chars += chars
     _day_chars += chars
+
+
+def charge_stt(seconds: float) -> None:
+    """Count audio seconds sent to Meta STT. Raises LimitHit once the case would go over its limit."""
+    usage = _usage.get()
+    if usage is None:
+        return
+    if usage.hit is not None or usage.stt_seconds + seconds > get_settings().max_stt_seconds_per_case:
+        _hit(usage, "stt")
+    usage.stt_seconds += seconds
 
 
 def allow_new_case(ip: str) -> bool:

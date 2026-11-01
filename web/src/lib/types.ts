@@ -1,4 +1,5 @@
-// Mirrors backend/app/schemas (events.py and the shapes it carries) and voice/audio_bus.py.
+// Mirrors backend/app/schemas (events.py and the shapes it carries), voice/audio_bus.py and
+// the patient session's messages in main.py.
 
 export type CaseStatus =
   | "new"
@@ -160,6 +161,50 @@ export interface ErrorEvent extends Base {
   code?: "limit" | "not_found" | "bad_message" | "running" | string;
 }
 
+/** Mirrors backend/app/schemas/preferences.py. */
+export interface Preferences {
+  treatment: "braces" | "aligners" | "not sure";
+  zip_code: string;
+  max_distance_mi: number;
+  budget_max: number;
+  pay_in_full_ok: boolean;
+  uses_hsa_fsa: boolean;
+  prefers_monthly: boolean;
+  has_xrays: boolean;
+  has_plan: boolean;
+  must_haves: string[];
+  free_times: string[];
+}
+
+/** What the patient has said so far (agent/intake.py PreferencesDraft); missing keys are unsaid. */
+export type PreferencesDraft = Partial<Preferences> & { city?: string };
+
+/** The question Lana asked last (agent/intake.py TOPIC_FIELDS). */
+export type IntakeTopic = "treatment" | "location" | "budget" | "pay" | "records" | "must_haves";
+
+/** main.py PatientSession: what the patient is saying, before the turn ends. */
+export interface UserPartial extends Base {
+  type: "user_partial";
+  text: string;
+}
+/** Speech to text can't be used; the browser switches to tap and type. */
+export interface SttUnavailable extends Base {
+  type: "stt_unavailable";
+}
+/** After each intake answer. `preferences` comes once intake is done. */
+export interface IntakeUpdate extends Base {
+  type: "intake";
+  topic: IntakeTopic | null;
+  done: boolean;
+  draft: PreferencesDraft;
+  preferences?: Preferences;
+}
+/** A spoken command the browser acts on itself. */
+export interface CommandEvent extends Base {
+  type: "command";
+  name: "start_over" | string;
+}
+
 /** audio_bus: frames for one line, pointing back to it with line_seq. */
 export interface AudioFrame extends Base {
   type: "audio";
@@ -183,7 +228,11 @@ export type ServerEvent =
   | OffersReady
   | CallbackStarted
   | Booked
-  | ErrorEvent;
+  | ErrorEvent
+  | UserPartial
+  | SttUnavailable
+  | IntakeUpdate
+  | CommandEvent;
 
 export type ServerMessage = ServerEvent | AudioFrame;
 
@@ -198,6 +247,7 @@ export function isLine(m: ServerMessage): m is LineEvent {
 
 export type ClientMessage =
   | { type: "start" }
+  | { type: "listen" }
   | { type: "stop" }
   | { type: "user_text"; text: string }
   | { type: "command"; name: string };

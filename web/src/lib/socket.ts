@@ -1,4 +1,5 @@
-// The case WebSocket: sends start / stop, hands every message to onMessage.
+// The case WebSocket: opens with start (Watch) or listen (the patient's voice intake), sends
+// stop, text and binary mic frames, and hands every message to onMessage.
 // An unexpected close reconnects once (the server cancels the run when a socket drops,
 // so the caller resets and the run starts over). A second close is fatal.
 
@@ -22,12 +23,14 @@ export class CaseSocket {
   constructor(
     private readonly caseId: string,
     private readonly handlers: CaseSocketHandlers,
+    private readonly opening: ClientMessage = { type: "start" },
   ) {}
 
   open(): void {
     const ws = new WebSocket(`${WS_URL}/ws/case/${encodeURIComponent(this.caseId)}`);
+    ws.binaryType = "arraybuffer";
     this.ws = ws;
-    ws.onopen = () => this.send({ type: "start" });
+    ws.onopen = () => this.send(this.opening);
     ws.onmessage = (e) => {
       if (typeof e.data !== "string") return;
       let msg: ServerMessage;
@@ -57,6 +60,11 @@ export class CaseSocket {
 
   send(msg: ClientMessage): void {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
+  }
+
+  /** One 100 ms mic frame (16-bit mono PCM, 24 kHz). Dropped while the socket is not open. */
+  sendAudio(frame: ArrayBuffer): void {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(frame);
   }
 
   stop(): void {
