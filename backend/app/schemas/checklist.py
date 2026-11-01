@@ -30,3 +30,5 @@ class ClinicChecklist(BaseModel):
     next_slots: SourcedAnswer[list[AwareDatetime]] | None = None
     evening_hours: SourcedAnswer[bool] | None = None
     needs_exam_first: SourcedAnswer[bool] | None = None
+    # total_price already covers every fee ("$5,050 all together"), so no fee is added on top.
+    total_is_all_in: bool = False

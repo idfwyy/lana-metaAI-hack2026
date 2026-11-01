@@ -2,9 +2,14 @@
 
 The model proposes values with a quote; Python decides whether the quote is real. A quote
 that is not in a clinic line is dropped, so a made-up fact never reaches the Quote.
+
+A total the clinic says already covers everything ("$5,050 all together") is all in: the
+records fee is never added to it again. The model flags it, and Python also checks the
+clinic's words.
 """
 
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Generic, TypeVar
@@ -13,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from app.config import get_settings
 from app.integrations.meta_llm import call_json
-from app.schemas.checklist import ClinicChecklist
+from app.schemas.checklist import ClinicChecklist, SourcedAnswer
 from app.schemas.enums import Speaker
 from app.schemas.quote import Quote
 
@@ -34,6 +39,26 @@ CHECKLIST_ORDER = [
 
 T = TypeVar("T")
 
+# Words in the total's evidence that mean it already covers every fee. These always win:
+# "$4,800 plus a $250 records fee, so $5,050 all together" is all in.
+_ALL_IN_RE = re.compile(
+    r"\b(all[ -]in|all together|altogether|in total|all told|everything included|"
+    r"(?<!not )includ(?:es|ing) (?:the )?records|records (?:are )?included|out the door)\b",
+    re.IGNORECASE,
+)
+# A bare "total" counts too, unless the same words say a fee comes on top ("$4,800 total, plus records").
+_TOTAL_RE = re.compile(r"\btotal\b", re.IGNORECASE)
+_ON_TOP_RE = re.compile(
+    r"\b(plus|on top|extra|separate(?:ly)?|not includ(?:ing|ed)|doesn'?t include|does not include|excluding)\b",
+    re.IGNORECASE,
+)
+
+
+def says_all_in(evidence: str) -> bool:
+    """True when the clinic's words for the total say it covers everything."""
+    text = evidence.replace("’", "'")
+    return bool(_ALL_IN_RE.search(text)) or (bool(_TOTAL_RE.search(text)) and not _ON_TOP_RE.search(text))
+
 
 class TranscriptLine(BaseModel):
     speaker: Speaker
@@ -52,10 +77,16 @@ class _Found(BaseModel, Generic[T]):
     evidence: str = Field(description="Exact words copied from one CLINIC line")
 
 
+class _Total(_Found[int]):
+    total_is_all_in: bool = Field(
+        default=False, description="True if the clinic said this total already includes every fee"
+    )
+
+
 class _Extraction(BaseModel):
     """What the model returns. call_id, speaker and t_seconds are filled in by Python."""
 
-    total_price: _Found[int] | None = None
+    total_price: _Total | None = None
     records_fee: _Found[int] | None = None
     consult_fee: _Found[int] | None = None
     includes: _Found[list[str]] | None = None
@@ -120,8 +151,10 @@ def _format_transcript(transcript: Transcript) -> str:
 
 def _format_current(checklist: ClinicChecklist) -> str:
     filled = {
-        name: answer.value for name, answer in checklist if answer is not None
+        name: answer.value for name, answer in checklist if isinstance(answer, SourcedAnswer)
     }
+    if checklist.total_price is not None and checklist.total_is_all_in:
+        filled["total_is_all_in"] = True
     if not filled:
         return "Nothing confirmed yet."
     return "\n".join(f"- {name}: {value}" for name, value in filled.items())
@@ -150,7 +183,7 @@ async def update_checklist(checklist: ClinicChecklist, transcript: Transcript) -
     )
 
     clinic_lines = [line for line in transcript.lines if line.speaker == Speaker.CLINIC]
-    updates: dict[str, dict] = {}
+    updates: dict[str, object] = {}
     for name, item in found:
         if item is None:
             continue
@@ -172,6 +205,15 @@ async def update_checklist(checklist: ClinicChecklist, transcript: Transcript) -
                 name,
                 item.evidence,
             )
+    if "total_price" in updates:
+        total = updates["total_price"]
+        all_in = found.total_price.total_is_all_in or says_all_in(total["evidence"])
+        if checklist.total_is_all_in and not all_in:
+            # The clinic already gave an all-in total; a treatment-only price never replaces it.
+            log.info("extractor call=%s kept the all-in total over %r", transcript.call_id, total["evidence"])
+            del updates["total_price"]
+        else:
+            updates["total_is_all_in"] = all_in
     return ClinicChecklist.model_validate({**checklist.model_dump(), **updates})
 
 
@@ -180,12 +222,22 @@ def _records_included(checklist: ClinicChecklist) -> bool:
     return any("record" in item.lower() for item in includes)
 
 
+def is_all_in(checklist: ClinicChecklist) -> bool:
+    """The total already covers every fee: flagged by the extractor, or plain in the clinic's words."""
+    total = checklist.total_price
+    return total is not None and (checklist.total_is_all_in or says_all_in(total.evidence))
+
+
 def build_quote(clinic_id: str, checklist: ClinicChecklist) -> Quote:
-    """All-in price = treatment plus the records fee when records are not included."""
+    """All-in price: the total if it is all in, else treatment plus the records fee when records are not included."""
     all_in = None
     if checklist.total_price is not None:
         all_in = checklist.total_price.value
-        if checklist.records_fee is not None and not _records_included(checklist):
+        if (
+            not is_all_in(checklist)
+            and checklist.records_fee is not None
+            and not _records_included(checklist)
+        ):
             all_in += checklist.records_fee.value
     return Quote(
         clinic_id=clinic_id,

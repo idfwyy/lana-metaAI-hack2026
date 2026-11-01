@@ -12,7 +12,9 @@ Today is {today}. The clinic is in the {timezone} time zone.
 
 ## Fields
 
-- total_price: the total price of the full treatment, in whole dollars.
+- total_price: the total price of the full treatment, in whole dollars, with total_is_all_in:
+  - total_is_all_in: true when the clinic's total clearly already includes everything, for example "all in", "all together", "total", "everything included", "including records", "out the door". false when it is the treatment price alone, for example "$4,800 for treatment, plus $250 for records".
+  - If the clinic gives a treatment price and also an all-in total ("$4,800 plus a $250 records fee, so $5,050 all together"), total_price is the all-in total (5050) with total_is_all_in true, and records_fee is still the fee (250).
 - records_fee: a separate fee for records (x-rays, scans, photos), in whole dollars. 0 if the clinic says there is no records fee.
 - consult_fee: the price of the first consult, in whole dollars. 0 if it is free.
 - includes: what the total price covers, as short lowercase items, for example "records", "x-rays", "scans", "adjustments", "retainers", "consult". Use "records" when the clinic says records, x-rays or scans are included.
@@ -29,5 +31,5 @@ Today is {today}. The clinic is in the {timezone} time zone.
 - Use only what a CLINIC line clearly says. Never use LANA's lines as a source, even if the clinic agrees with them; quote the clinic's own words instead.
 - For every field you fill, "evidence" must be words copied exactly, in order, from one CLINIC line. Copy the shortest part that proves the value, for example "$4,200 total".
 - If the clinic did not say it, was unsure, or said it would need to check, use null. Never guess or work a number out yourself.
-- If the clinic changed an answer later in the call, use the latest one.
+- If the clinic changed an answer later in the call, use the latest one. An all-in total stays the total even if the clinic mentions the treatment price alone again later.
 - Money is a whole number of dollars, no $ sign or commas.

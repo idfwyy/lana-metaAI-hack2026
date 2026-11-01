@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from app.agent import extractor
-from app.agent.extractor import Transcript, build_quote, find_evidence, update_checklist
+from app.agent.extractor import Transcript, build_quote, find_evidence, says_all_in, update_checklist
 from app.config import get_settings
 from app.schemas.checklist import ClinicChecklist, SourcedAnswer
 from app.schemas.enums import Speaker
@@ -149,7 +149,7 @@ async def test_unknown_fields_stay_none(fake_json) -> None:
     checklist = await update_checklist(ClinicChecklist(), _sunrise())
 
     for name in ClinicChecklist.model_fields:
-        if name != "total_price":
+        if name not in ("total_price", "total_is_all_in"):
             assert getattr(checklist, name) is None, name
 
 
@@ -224,3 +224,131 @@ def test_quote_unknown_records_fee_adds_nothing() -> None:
     assert quote.all_in_price == 4200
     assert quote.is_solid
     assert "records_fee" in quote.missing_fields
+
+
+# ---------- all-in totals: a fee is never counted twice ----------
+
+
+def _call(*clinic_lines: str) -> Transcript:
+    lines = [{"speaker": "agent", "text": "How much is the full treatment?", "t_seconds": 0.0}]
+    lines += [{"speaker": "clinic", "text": t, "t_seconds": 2.0 + 4 * i} for i, t in enumerate(clinic_lines)]
+    return Transcript.model_validate({"call_id": "c3", "clinic_id": "parkway", "lines": lines})
+
+
+PARKWAY_LINE = "Our comprehensive treatment is $4,800 plus a $250 records fee, so $5,050 all together."
+
+
+async def test_5050_all_together_is_not_charged_the_records_fee_again(fake_json) -> None:
+    fake_json(
+        {
+            "total_price": {"value": 5050, "evidence": "$5,050 all together", "total_is_all_in": True},
+            "records_fee": {"value": 250, "evidence": "a $250 records fee"},
+        }
+    )
+
+    checklist = await update_checklist(ClinicChecklist(), _call(PARKWAY_LINE))
+
+    assert checklist.total_is_all_in is True
+    assert checklist.records_fee.value == 250
+    assert build_quote("parkway", checklist).all_in_price == 5050
+
+
+async def test_treatment_plus_records_adds_the_fee(fake_json) -> None:
+    fake_json(
+        {
+            "total_price": {"value": 4800, "evidence": "$4,800 for treatment", "total_is_all_in": False},
+            "records_fee": {"value": 250, "evidence": "plus $250 records"},
+        }
+    )
+
+    checklist = await update_checklist(ClinicChecklist(), _call("It's $4,800 for treatment, plus $250 records."))
+
+    assert checklist.total_is_all_in is False
+    assert build_quote("parkway", checklist).all_in_price == 5050
+
+
+async def test_total_including_records_is_the_price(fake_json) -> None:
+    fake_json(
+        {
+            "total_price": {"value": 4200, "evidence": "the total is $4,200 including records", "total_is_all_in": True},
+            "records_fee": {"value": 150, "evidence": "records alone would be $150"},
+        }
+    )
+
+    checklist = await update_checklist(
+        ClinicChecklist(), _call("So the total is $4,200 including records. Records alone would be $150.")
+    )
+
+    assert build_quote("lakeside", checklist).all_in_price == 4200
+
+
+async def test_all_in_words_override_a_model_that_says_false(fake_json) -> None:
+    fake_json(
+        {
+            "total_price": {"value": 5050, "evidence": "$5,050 all in", "total_is_all_in": False},
+            "records_fee": {"value": 250, "evidence": "$250 records fee"},
+        }
+    )
+
+    checklist = await update_checklist(
+        ClinicChecklist(), _call("Treatment with the $250 records fee comes to $5,050 all in.")
+    )
+
+    assert checklist.total_is_all_in is True
+    assert build_quote("parkway", checklist).all_in_price == 5050
+
+
+def test_all_in_words_in_the_evidence_count_even_without_the_flag() -> None:
+    checklist = ClinicChecklist(
+        total_price=_answer(5050, "$5,050 all together."),
+        records_fee=_answer(250),
+    )
+
+    assert checklist.total_is_all_in is False
+    assert build_quote("parkway", checklist).all_in_price == 5050
+
+
+async def test_a_later_treatment_price_never_replaces_the_all_in_total(fake_json) -> None:
+    fake_json(
+        {
+            "total_price": {"value": 4800, "evidence": "the $4,800 covers adjustments", "total_is_all_in": False},
+            "records_fee": {"value": 250, "evidence": "a $250 records fee"},
+        }
+    )
+    before = ClinicChecklist(total_price=_answer(5050, "$5,050 all together.", 2.0), total_is_all_in=True)
+
+    checklist = await update_checklist(before, _call(PARKWAY_LINE, "And the $4,800 covers adjustments."))
+
+    assert checklist.total_price.value == 5050 and checklist.total_is_all_in
+    assert build_quote("parkway", checklist).all_in_price == 5050
+
+
+async def test_the_model_sees_the_all_in_flag(fake_json) -> None:
+    fake = fake_json({})
+    before = ClinicChecklist(total_price=_answer(5050, "$5,050 all together.", 2.0), total_is_all_in=True)
+
+    await update_checklist(before, _call(PARKWAY_LINE))
+
+    assert "total_price: 5050" in fake.prompts[0]
+    assert "total_is_all_in: True" in fake.prompts[0]
+    assert "total_is_all_in" in fake.prompts[0].split("## Rules")[0]  # the prompt explains it
+
+
+@pytest.mark.parametrize(
+    "evidence, all_in",
+    [
+        ("$5,050 all together", True),
+        ("$4,800 plus a $250 records fee, so $5,050 all together", True),
+        ("the total is $4,200 including records", True),
+        ("$4,500 all-in", True),
+        ("$4,200 total.", True),
+        ("$3,990 out the door", True),
+        ("everything included, $4,650", True),
+        ("$4,800 for treatment", False),
+        ("$4,800 total, plus records", False),
+        ("$4,800, not including records", False),
+        ("$4,800 for braces", False),
+    ],
+)
+def test_says_all_in(evidence, all_in) -> None:
+    assert says_all_in(evidence) is all_in
