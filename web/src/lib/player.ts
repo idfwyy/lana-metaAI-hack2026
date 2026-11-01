@@ -29,8 +29,11 @@ export type PlayFn = (chunks: string[]) => Promise<PlayingLine>;
 export interface PlayerHandlers {
   apply: (event: ServerEvent) => void;
   reveal: (seq: number, count: number) => void;
-  /** Lana's line starts (true) or ends (false), so the mic can mute and she never hears herself. */
-  speaking?: (on: boolean) => void;
+  /**
+   * Lana's line starts (true) or ends (false). toPatient: she is talking to the patient, who may
+   * talk over her (barge-in); otherwise it is a clinic call and the mic stays muted.
+   */
+  speaking?: (on: boolean, toPatient: boolean) => void;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -62,6 +65,8 @@ export class Player {
   private gen = 0;
   private current: PlayingLine | null = null;
   private muted = false;
+  private toPatient: number | null = null; // seq of Lana's line to the patient that is playing
+  private barged: number | null = null; // seq of the line the patient talked over
 
   constructor(
     private readonly handlers: PlayerHandlers,
@@ -87,6 +92,17 @@ export class Player {
     void this.pump();
   }
 
+  /**
+   * The patient talked over Lana: her line to them stops now and shows whole. Returns false if
+   * no such line is playing (a clinic call, or she already finished).
+   */
+  bargeIn(): boolean {
+    if (this.toPatient === null) return false;
+    this.barged = this.toPatient;
+    this.current?.stop();
+    return true;
+  }
+
   /** Drops everything: Stop, Start over, or a reconnect that restarts the run. */
   reset(): void {
     this.gen++;
@@ -99,7 +115,9 @@ export class Player {
     this.current?.stop();
     this.current = null;
     stopAllAudio();
-    this.handlers.speaking?.(false);
+    this.toPatient = null;
+    this.barged = null;
+    this.handlers.speaking?.(false, false);
   }
 
   private storeFrame(f: AudioFrame): void {
@@ -152,11 +170,14 @@ export class Player {
 
   private async playOne(line: LineEvent, gen: number): Promise<void> {
     const lana = line.type === "agent_said" || (line.type === "transcript_final" && line.speaker === "agent");
-    if (lana) this.handlers.speaking?.(true);
+    const toPatient = line.type === "agent_said" && line.call_id === null;
+    if (toPatient) this.toPatient = line.seq!;
+    if (lana) this.handlers.speaking?.(true, toPatient);
     try {
       await this.playLineOnce(line, gen);
     } finally {
-      if (lana && gen === this.gen) this.handlers.speaking?.(false);
+      if (toPatient) this.toPatient = null;
+      if (lana && gen === this.gen) this.handlers.speaking?.(false, toPatient);
     }
   }
 
@@ -215,7 +236,7 @@ export class Player {
     }
     if (gen !== this.gen) return;
 
-    if (!played) {
+    if (!played && this.barged !== seq) {
       const total = (words / WORDS_PER_SECOND) * 1000;
       const startedAt = performance.now();
       while (gen === this.gen) {
@@ -233,6 +254,7 @@ export class Player {
   private async waitForAudio(seq: number, gen: number): Promise<string[] | null> {
     const reachedAt = performance.now();
     while (gen === this.gen) {
+      if (this.barged === seq) return null; // talked over before her audio even arrived
       const a = this.audio.get(seq);
       if (a?.done) {
         this.audio.delete(seq);

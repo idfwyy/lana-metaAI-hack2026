@@ -60,3 +60,8 @@ def load_demo_clinics(today: date | None = None) -> list[tuple[Clinic, PriceShee
 def get_public_clinics() -> list[Clinic]:
     """Public clinic info only, safe to show the agent. No price data."""
     return [clinic for clinic, _ in load_demo_clinics()]
+
+
+def public_openings() -> dict[str, list[datetime]]:
+    """Each clinic's open consult times, as its online booking page shows them. No price data."""
+    return {clinic.id: list(sheet.open_slots) for clinic, sheet in load_demo_clinics()}

@@ -96,6 +96,7 @@ def _price_sheet_text(clinic: Clinic, sheet: PriceSheet) -> str:
             f"- Monthly plan: {_money(sheet.monthly)} a month with "
             f"{_money(sheet.down_payment)} down",
             f"- Open consult slots: {slots}",
+            f"- Other facts: {' '.join(sheet.facts) or 'none'}",
         ]
     )
 

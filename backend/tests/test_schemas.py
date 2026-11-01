@@ -41,7 +41,7 @@ def test_ids_are_unique():
 
 def test_open_slots_are_chicago_time():
     for _, sheet in load_demo_clinics():
-        assert len(sheet.open_slots) == 3
+        assert len(sheet.open_slots) >= 3
         for slot in sheet.open_slots:
             assert slot.tzinfo is not None
             assert slot.utcoffset() == slot.astimezone(CHICAGO).utcoffset()
@@ -58,19 +58,19 @@ def test_open_slots_are_in_the_next_10_days():
 def test_open_slots_handle_dst_change():
     # Nov 1, 2026 is when Chicago falls back from CDT (-5) to CST (-6).
     sheets = {clinic.id: sheet for clinic, sheet in load_demo_clinics(today=date(2026, 10, 29))}
-    sunrise_first = sheets["sunrise"].open_slots[0]  # day 1 -> Oct 30, before the change
-    parkway_first = sheets["parkway"].open_slots[0]  # day 4 -> Nov 2, after the change
-    assert sunrise_first.date() == date(2026, 10, 30)
-    assert sunrise_first.utcoffset() == timedelta(hours=-5)
-    assert parkway_first.date() == date(2026, 11, 2)
-    assert parkway_first.utcoffset() == timedelta(hours=-6)
-    assert (parkway_first.hour, parkway_first.minute) == (17, 30)
+    sunrise_friday = sheets["sunrise"].open_slots[2]  # Friday -> Oct 30, before the change
+    parkway_tuesday = sheets["parkway"].open_slots[0]  # Tuesday -> Nov 3, after the change
+    assert sunrise_friday.date() == date(2026, 10, 30)
+    assert sunrise_friday.utcoffset() == timedelta(hours=-5)
+    assert parkway_tuesday.date() == date(2026, 11, 3)
+    assert parkway_tuesday.utcoffset() == timedelta(hours=-6)
+    assert (parkway_tuesday.hour, parkway_tuesday.minute) == (17, 30)
 
 
 def test_lakeside_weekday_slots_land_on_saturday():
     raw = json.loads(DEMO_CLINICS_PATH.read_text(encoding="utf-8"))
     lakeside_raw = next(e for e in raw if e["clinic"]["id"] == "lakeside")
-    weekday_idx = [i for i, s in enumerate(lakeside_raw["price_sheet"]["open_slots"]) if "weekday" in s]
+    weekday_idx = [i for i, s in enumerate(lakeside_raw["price_sheet"]["open_slots"]) if s.get("weekday") == "saturday"]
     assert len(weekday_idx) == 2
 
     # Two weeks of start dates covers every weekday, including the Nov 1 clock change.

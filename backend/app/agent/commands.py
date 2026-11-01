@@ -53,8 +53,14 @@ PHRASES: dict[Command, tuple[str, ...]] = {
         "start over", "start again", "let's start over", "let's start again", "begin again",
         "restart", "reset",
     ),
-    Command.YES_BOOK: ("yes", "yeah", "yep", "yes book it", "book it", "sure", "go ahead", "do it"),
-    Command.NOT_YET: ("not yet", "no", "nope", "not now", "maybe later", "later"),
+    Command.YES_BOOK: (
+        "yes", "yeah", "yep", "yes book it", "book it", "sure", "go ahead", "do it",
+        "book it anyway", "yes book it anyway", "go ahead and book it",
+    ),
+    Command.NOT_YET: (
+        "not yet", "no", "nope", "not now", "maybe later", "later", "hold off", "hold off for now",
+        "don't book it", "dont book it", "no thanks", "no thank you",
+    ),
     Command.SKIP: ("skip", "skip it", "skip that", "skip this", "skip this one", "pass", "next question"),
 }
 _BY_PHRASE = {phrase: command for command, phrases in PHRASES.items() for phrase in phrases}

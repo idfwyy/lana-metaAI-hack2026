@@ -1,6 +1,12 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from app.schemas.enums import Treatment
+
+TimePref = Literal["morning", "afternoon", "evening", "weekend", "any"]
+# How Lana says a time preference out loud: "mornings, got it", "no mornings".
+TIME_PLURAL = {"morning": "mornings", "afternoon": "afternoons", "evening": "evenings", "weekend": "weekends"}
 
 
 class Preferences(BaseModel):
@@ -18,3 +24,10 @@ class Preferences(BaseModel):
     has_plan: bool = False
     must_haves: list[str] = Field(default_factory=list, examples=[["evening hours"]])
     free_times: list[str] = Field(default_factory=list, examples=[["weekday evenings"]])
+    # When the patient wants their appointments. "any" means they didn't say.
+    time_pref: TimePref = "any"
+    # Short plain notes of anything else the patient said that matters, in their order.
+    notes: list[str] = Field(default_factory=list, examples=[["nervous about pain", "wants Spanish-speaking staff"]])
+    # A place outside the DFW city list, as the patient said it ("San Francisco"). The demo
+    # clinics are placed near it; zip_code then stays the default.
+    place: str | None = None

@@ -55,11 +55,28 @@ def test_order_is_deterministic() -> None:
     assert offers[0].score >= offers[1].score >= offers[2].score
 
 
-def test_over_budget_clinic_filtered_out() -> None:
+def test_over_budget_offer_is_kept_and_ranked_after_the_ones_within_budget() -> None:
     offers = rank_offers(_quotes(), get_public_clinics(), _prefs(budget_max=5000), now=NOW)
 
-    assert "parkway" not in _ids(offers)  # $5,050 all in
-    assert _ids(offers) == ["sunrise", "lakeside"]
+    # Parkway scores best but is $5,050 all in, $50 over: it comes last, marked, never dropped.
+    assert _ids(offers) == ["sunrise", "lakeside", "parkway"]
+    assert [o.over_budget_by for o in offers] == [0, 0, 50]
+    assert [o.rank for o in offers] == [1, 2, 3]
+
+
+def test_when_nothing_is_within_budget_the_best_scorer_leads_and_says_how_far_over() -> None:
+    offers = rank_offers(_quotes(), get_public_clinics(), _prefs(budget_max=3000), now=NOW)
+
+    assert all(o.over_budget_by > 0 for o in offers)
+    assert _ids(offers)[0] == "parkway"  # the same order as with no budget at all
+    assert offers[0].over_budget_by == 5050 - 3000
+
+
+def test_unknown_price_is_not_over_budget() -> None:
+    clinic = get_public_clinics()[0]
+    quote = Quote(clinic_id=clinic.id, checklist=ClinicChecklist())
+
+    assert rank_offers([quote], [clinic], _prefs(budget_max=1), now=NOW)[0].over_budget_by == 0
 
 
 def test_negotiated_price_is_used() -> None:
@@ -80,7 +97,9 @@ def test_distance_and_no_plan_filters() -> None:
 
     offers = rank_offers(quotes, get_public_clinics(), _prefs(max_distance_mi=6), now=NOW)
 
-    assert _ids(offers) == []  # parkway over budget, sunrise has no plan, lakeside is 8 mi
+    # Sunrise has no monthly plan and Lakeside is 8 mi; Parkway stays, $50 over budget.
+    assert _ids(offers) == ["parkway"]
+    assert offers[0].over_budget_by == 50
 
 
 def test_ties_break_on_clinic_id() -> None:

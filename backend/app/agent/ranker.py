@@ -1,5 +1,8 @@
 """Plain Python ranking -> top 3 Offers. The AI only writes tradeoff lines afterwards.
 
+Offers over the patient's budget are kept, marked with over_budget_by, and ranked after every
+offer within it: the patient hears the honest best result even when nobody met the budget.
+
 score = weighted sum of sub-scores, each 0 to 1 (weights in config.RANKING_WEIGHTS):
 - price: cheapest all-in among the kept quotes / this all-in
 - fit: share of the patient's must-haves the clinic confirmed ("evening hours" maps to the
@@ -39,9 +42,12 @@ def all_in(quote: Quote, negotiation: NegotiationResult | None = None) -> int | 
 
 
 def passes_filters(
-    quote: Quote, clinic: Clinic, prefs: Preferences, price: int | None, check_budget: bool = True
+    quote: Quote, clinic: Clinic, prefs: Preferences, price: int | None, check_budget: bool = False
 ) -> bool:
-    """Hard filters. Unknown values pass: only a confirmed answer can rule a clinic out."""
+    """Hard filters. Unknown values pass: only a confirmed answer can rule a clinic out.
+
+    The budget is not a filter by default: an offer over it is ranked last, never dropped.
+    """
     if check_budget and price is not None and price > prefs.budget_max:
         return False
     if clinic.distance_mi > prefs.max_distance_mi:
@@ -99,6 +105,11 @@ def weighted(scores: dict[str, float], skip: str | None = None) -> float:
     return _clamp(sum(scores[name] * w for name, w in weights.items()) / total)
 
 
+def over_budget_by(price: int | None, prefs: Preferences) -> int:
+    """Dollars over the budget, 0 when within it or when the price is unknown."""
+    return max(0, price - prefs.budget_max) if price is not None else 0
+
+
 def rank_offers(
     quotes: list[Quote],
     clinics: list[Clinic],
@@ -106,7 +117,10 @@ def rank_offers(
     negotiations: list[NegotiationResult] | None = None,
     now: datetime | None = None,
 ) -> list[Offer]:
-    """Up to 3 Offers, best first. Ties break on clinic id so the order is always the same."""
+    """Up to 3 Offers, best first: within budget before over it, then by score.
+
+    Ties break on clinic id so the order is always the same.
+    """
     now = now or datetime.now(get_settings().tz)
     by_id = {c.id: c for c in clinics}
     deals = {n.clinic_id: n for n in negotiations or []}
@@ -123,10 +137,15 @@ def rank_offers(
     prices = [price for _, _, price in kept if price is not None]
     cheapest = min(prices) if prices else None
     scored = [
-        (weighted(sub_scores(quote, clinic, preferences, price, cheapest, now)), quote, clinic)
+        (
+            weighted(sub_scores(quote, clinic, preferences, price, cheapest, now)),
+            quote,
+            clinic,
+            over_budget_by(price, preferences),
+        )
         for quote, clinic, price in kept
     ]
-    scored.sort(key=lambda item: (-item[0], item[2].id))
+    scored.sort(key=lambda item: (item[3] > 0, -item[0], item[2].id))
 
     return [
         Offer(
@@ -136,8 +155,9 @@ def rank_offers(
             negotiation=deals.get(clinic.id),
             score=round(score, 4),
             unknowns=list(quote.missing_fields),
+            over_budget_by=over,
         )
-        for i, (score, quote, clinic) in enumerate(scored[:MAX_OFFERS], start=1)
+        for i, (score, quote, clinic, over) in enumerate(scored[:MAX_OFFERS], start=1)
     ]
 
 

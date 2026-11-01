@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     stt_realtime_url: str = ""
     # reasoning_effort for live call turns. "none" is rejected by Muse models; "minimal" is lowest.
     call_reasoning: Literal["minimal", "low", "medium", "high", "xhigh", "max"] = "minimal"
+    # The model and reasoning level for Lana's intake turns. A blank model means MODEL_FAST.
+    # Picked by testing; see docs/decisions.md.
+    intake_model: str = ""
+    intake_reasoning: Literal["minimal", "low", "medium", "high", "xhigh", "max"] = "low"
 
     # Voice
     elevenlabs_api_key: SecretStr = SecretStr("")
@@ -82,6 +86,9 @@ class Settings(BaseSettings):
     voice_clinic_3: str = ""
     # The demo patient in Watch mode. Blank falls back to VOICE_CLINIC_1.
     voice_patient: str = ""
+
+    # Turn taking: after Meta ends a turn, wait this long in case the patient keeps talking.
+    end_grace_ms: int = Field(default=700, ge=0, le=5000)
 
     # App
     database_url: str = "sqlite:///./data/dev.db"

@@ -352,3 +352,40 @@ async def test_the_model_sees_the_all_in_flag(fake_json) -> None:
 )
 def test_says_all_in(evidence, all_in) -> None:
     assert says_all_in(evidence) is all_in
+
+
+# ---------- the answer to Lana's note question ----------
+
+SPANISH = "Does anyone at your office speak Spanish?"
+
+
+async def test_note_answer_is_sourced_from_the_clinic(fake_json) -> None:
+    fake = fake_json({"note_answer": {"value": "Yes, two assistants speak Spanish", "evidence": "two of our assistants speak Spanish"}})
+
+    checklist = await update_checklist(
+        ClinicChecklist(note_question=SPANISH), _call("Yes, two of our assistants speak Spanish.")
+    )
+
+    assert checklist.note_question == SPANISH
+    assert checklist.note_answer.value == "Yes, two assistants speak Spanish"
+    assert checklist.note_answer.evidence == "two of our assistants speak Spanish."
+    assert checklist.note_answer.speaker == Speaker.CLINIC
+    assert f'"{SPANISH}"' in fake.prompts[0]
+
+
+async def test_note_answer_the_clinic_never_gave_stays_not_confirmed(fake_json) -> None:
+    fake_json({"note_answer": {"value": "Yes, Spanish speakers", "evidence": "we have Spanish speakers"}})
+
+    checklist = await update_checklist(
+        ClinicChecklist(note_question=SPANISH), _call("I'd need to check on that for you.")
+    )
+
+    assert checklist.note_answer is None
+
+
+async def test_no_note_question_means_no_note_answer(fake_json) -> None:
+    fake_json({"note_answer": {"value": "Spanish", "evidence": "we speak Spanish"}})
+
+    checklist = await update_checklist(ClinicChecklist(), _call("Sure, we speak Spanish here."))
+
+    assert checklist.note_answer is None

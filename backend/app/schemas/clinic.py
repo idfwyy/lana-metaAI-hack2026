@@ -32,6 +32,9 @@ class PriceSheet(BaseModel):
     will_add_retainers: bool
     open_slots: list[AwareDatetime]
     personality: str
+    # Other things the front desk knows ("Two assistants speak Spanish."). Anything not here
+    # the receptionist has to check on, so it stays not confirmed.
+    facts: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _floor_not_above_list(self) -> "PriceSheet":

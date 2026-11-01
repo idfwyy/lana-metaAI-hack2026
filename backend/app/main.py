@@ -31,8 +31,8 @@ from app import guard
 from app.agent.commands import Command as SpokenCommand
 from app.agent.commands import parse_command
 from app.agent.caller import opening_lines
-from app.agent.intake import TOPIC_FIELDS, Intake, fillers
-from app.agent.orchestrator import Orchestrator, first_slot, spoken_slot
+from app.agent.intake import TOPIC_FIELDS, Intake
+from app.agent.orchestrator import Orchestrator, pick_slot, spoken_slot
 from app.cli import DEMO_PREFERENCES
 from app.config import get_settings
 from app.data.loader import get_public_clinics
@@ -41,7 +41,7 @@ from app.integrations import meta_llm
 from app.schemas.case import Case
 from app.schemas.enums import CaseStatus, DemoMode, Speaker
 from app.schemas.events import AgentSaid, UserSaid
-from app.schemas.preferences import Preferences
+from app.schemas.preferences import TIME_PLURAL, Preferences
 from app.voice import tts
 from app.voice.audio_bus import AudioBus
 from app.voice.stt import AUDIO_FORMAT, CHUNK_MS, Final, Partial, StreamingSTT, STTUnavailable
@@ -62,17 +62,21 @@ COMING_SOON = "That mode is coming soon."
 SORRY = "Sorry, I missed that. Could you say it again?"
 # The callback, after Lana's summary.
 BOOK_QUESTION = "Want me to book it?"
+BOOK_ANYWAY = "Want me to book it anyway, or hold off?"  # when even the best offer is over budget
 BOOK_AGAIN = "Should I book it? You can say yes or not yet."
 BOOKED_LINE = "You're booked at {clinic} for {slot}. This is a demo clinic, so no real appointment was made."
 SAVED_LINE = "Saved, not booked. I'll hold this quote for you."
 NO_SLOT_LINE = "They didn't give me an opening time yet, so I saved the quote instead. I'll hold it for you."
+# When the winner has no opening in the patient's preferred time: said instead of BOOK_QUESTION.
+NO_MATCH_QUESTION = "They don't have {times}. The earliest is {slot}. Want that, or should I hold off?"
 # Watch mode: the demo patient's reply when Lana asks about something their scenario doesn't
 # cover, and her line if intake fails (the scenario's own preferences are used then).
 DEMO_DONE_LINE = "That's it, go ahead."
 DEMO_FALLBACK_CONFIRM = "Got it. I'm calling clinics now. You can watch, or step away and I'll call you back."
 FIXED_LINES = [COMING_SOON, SORRY, BOOK_AGAIN, SAVED_LINE, NO_SLOT_LINE, DEMO_FALLBACK_CONFIRM]
-# A filler plays if Lana's reply isn't ready this soon after the patient's turn ends.
-FILLER_AFTER_S = 0.4
+# A partial during the grace period means the patient is talking again; if Meta never sends
+# that utterance's final, the turn is committed this long after the partial anyway.
+GRACE_PARTIAL_EXTRA_S = 3.0
 
 DEMO_PATIENTS_PATH = Path(__file__).resolve().parent / "data" / "demo_patients.json"
 
@@ -137,13 +141,13 @@ def _demo_patient_lines() -> list[str]:
 async def _prewarm_lines() -> None:
     """Cache the fixed lines in TTS, so they play at once and cost credits only once.
 
-    Lana's patient lines, fillers and call openings, then the demo patient's lines.
+    Lana's patient lines and call openings, then the demo patient's lines.
     """
     if not get_settings().elevenlabs_api_key.get_secret_value():
         return
     intake_lines = Intake()._lines
     lana = [
-        _greeting(), *FIXED_LINES, *fillers(),
+        _greeting(), *FIXED_LINES,
         *(intake_lines[topic] for topic in TOPIC_FIELDS),
         *(intake_lines[f"again_{topic}"] for topic in TOPIC_FIELDS),
         *(intake_lines[f"default_{topic}"] for topic in TOPIC_FIELDS),
@@ -254,8 +258,14 @@ class Stop(BaseModel):
     type: Literal["stop"]
 
 
+class BargeIn(BaseModel):
+    """The patient started talking over Lana: the browser already stopped her audio."""
+
+    type: Literal["barge_in"]
+
+
 ClientMessage = TypeAdapter(
-    Annotated[Start | Listen | UserText | Command | Answer | Stop, Field(discriminator="type")]
+    Annotated[Start | Listen | UserText | Command | Answer | Stop | BargeIn, Field(discriminator="type")]
 )
 
 
@@ -334,6 +344,9 @@ class LineClock:
 
     def track(self, payload: dict) -> None:
         kind = payload.get("type")
+        if kind == "audio" and payload.get("cut"):
+            self.interrupt()  # a line cut short by the patient ends now
+            return
         if kind == "agent_said":
             self._open, self._bytes, self._words = True, 0, len(payload.get("text", "").split())
         elif kind == "audio" and self._open and payload.get("speaker") == Speaker.AGENT.value:
@@ -346,6 +359,11 @@ class LineClock:
 
     def speaking(self) -> bool:
         return self._open or time.monotonic() < self._until
+
+    def interrupt(self) -> None:
+        """The patient talked over Lana: her line, and any queued after it, end now."""
+        self._open = False
+        self._until = 0.0
 
 
 def _normalize(text: str) -> str:
@@ -397,7 +415,12 @@ class PatientSession:
         self._listener: asyncio.Task | None = None
         self._tasks: set[asyncio.Task] = set()
         self._turns = asyncio.Lock()
-        self._last_filler: str | None = None
+        self._other_time = False  # the callback offered a slot outside the patient's preferred time
+        self._turn_no = 0  # turns taken; the greeting belongs to turn 0
+        self._cut_turn: int | None = None  # the turn whose lines the patient talked over
+        # Finals heard in the grace period, joined into one turn when it ends.
+        self._pending: list[str] = []
+        self._commit: asyncio.Task | None = None
 
     def _spawn(self, coro: Coroutine) -> asyncio.Task:
         with guard.case_usage(self.usage):
@@ -410,7 +433,24 @@ class PatientSession:
         self._spawn(self._say(_greeting()))
 
     def muted(self) -> bool:
-        return self.thinking or self.clock.speaking()
+        # After a barge-in the patient has the turn, even while Lana's turn is still finishing.
+        thinking = self.thinking and self._cut_turn != self._turn_no
+        return thinking or self.clock.speaking()
+
+    def barge_in(self) -> bool:
+        """The patient talked over Lana (the browser stopped her audio). Not during the calls.
+
+        The line in progress stops sending, the rest of her current turn is not said, and
+        what the patient says next is a new turn.
+        """
+        if self.phase in ("calls", "over"):
+            return False
+        log.info("case=%s barge-in during turn %d", self.record.case.id, self._turn_no)
+        self._cut_turn = self._turn_no
+        self.bus.cut()
+        self.clock.interrupt()
+        self.resume_listening()
+        return True
 
     def audio(self, chunk: bytes) -> None:
         """One mic frame from the browser. Dropped while Lana has the turn; never sent to Meta."""
@@ -441,6 +481,9 @@ class PatientSession:
             await _cancel(task)
 
     async def _say(self, text: str) -> None:
+        if self._cut_turn == self._turn_no:
+            log.info("case=%s not said, the patient talked over this turn: %r", self.record.case.id, text)
+            return
         await self.bus.emit(AgentSaid(case_id=self.record.case.id, text=text))
 
     # ----- listening -----
@@ -517,7 +560,11 @@ class PatientSession:
         async for event in stt:
             if isinstance(event, Partial):
                 if not self.muted() and self.phase != "calls":
-                    await self.bus.send_payload({"type": "user_partial", "text": event.text})
+                    if self._pending:
+                        # Still talking after a pause: hold the turn open a while longer.
+                        self._arm_commit(get_settings().end_grace_ms / 1000 + GRACE_PARTIAL_EXTRA_S)
+                    text = " ".join([*self._pending, event.text])
+                    await self.bus.send_payload({"type": "user_partial", "text": text})
             elif isinstance(event, Final):
                 if self.muted() or not self.listening:
                     log.info("case=%s heard %r while Lana had the turn; ignored", self.record.case.id, event.text)
@@ -528,28 +575,36 @@ class PatientSession:
                     else:
                         log.info("case=%s heard %r during the calls; ignored", self.record.case.id, event.text)
                 else:
-                    self.thinking = True  # before the task starts, so a second final can't slip in
-                    self._turn_heard = True
-                    self._spawn(self._turn(event.text))
+                    # A pause may not be the end: wait END_GRACE_MS in case the patient goes on.
+                    self._pending.append(event.text.strip())
+                    self._arm_commit(get_settings().end_grace_ms / 1000)
+
+    def _arm_commit(self, delay: float) -> None:
+        if self._commit is not None and not self._commit.done():
+            self._commit.cancel()
+        self._commit = self._spawn(self._commit_after(delay))
+
+    async def _commit_after(self, delay: float) -> None:
+        """The grace period ended with no more speech: everything heard is one turn."""
+        await asyncio.sleep(delay)
+        text = " ".join(t for t in self._pending if t)
+        self._pending = []
+        if not text or not self.listening:
+            return
+        self.thinking = True  # before the task starts, so a second final can't slip in
+        self._turn_heard = True
+        self._spawn(self._turn(text))
 
     # ----- turns -----
-
-    def _filler(self) -> str:
-        """A short filler, never the same one twice in a row."""
-        choices = [f for f in fillers() if f != self._last_filler] or fillers()
-        self._last_filler = random.choice(choices)
-        return self._last_filler
 
     async def _turn(self, text: str) -> None:
         text = text.strip()
         async with self._turns:
+            self._turn_no += 1
             self.thinking = True
+            # No filler words while she thinks: the browser shows a quiet thinking state instead.
             work = asyncio.create_task(self._handle(text))
             try:
-                # No dead air: if her reply isn't ready soon, Lana says "Mm-hm." while it comes.
-                done, _ = await asyncio.wait({work}, timeout=FILLER_AFTER_S)
-                if not done and self.phase == "intake":
-                    await self._say(self._filler())
                 await work
             except guard.LimitHit:
                 self.stop_listening()
@@ -635,10 +690,23 @@ class PatientSession:
         self.phase = "callback"
         self._unclear = 0
         self.resume_listening()
-        await self._say(f"{orchestrator.summary} {BOOK_QUESTION}")
+        top = orchestrator.case.offers[0]
+        prefs = orchestrator.case.preferences
+        time_pref = prefs.time_pref if prefs is not None else "any"
+        slot, matches = pick_slot(top, time_pref)
+        self._other_time = slot is not None and not matches
+        if self._other_time:
+            # Honest: no opening in the time they asked for. Booking another time needs their yes.
+            question = NO_MATCH_QUESTION.format(times=TIME_PLURAL[time_pref], slot=spoken_slot(slot))
+        else:
+            question = BOOK_ANYWAY if top.over_budget_by > 0 else BOOK_QUESTION
+        await self._say(f"{orchestrator.summary} {question}")
 
     async def _booking_answer(self, text: str) -> None:
-        """Yes books the winner's first slot; not yet saves the quote. Nothing books without a clear yes."""
+        """Yes books the winner's slot in the patient's time (or the one Lana offered); not yet saves the quote.
+
+        Nothing books without a clear yes.
+        """
         orchestrator = self.orchestrator
         assert orchestrator is not None
         command = await parse_command(text, classify=True)
@@ -657,11 +725,14 @@ class PatientSession:
         self.phase = "over"
         self.stop_listening()
         top = orchestrator.case.offers[0] if orchestrator.case.offers else None
-        slot = first_slot(top) if top is not None else None
+        prefs = orchestrator.case.preferences
+        time_pref = prefs.time_pref if prefs is not None else "any"
+        slot = pick_slot(top, time_pref)[0] if top is not None else None
         # Lana's line plays before the outcome event, so Done appears once she has said it.
         if command == SpokenCommand.YES_BOOK and top is not None and slot is not None:
             await self._say(BOOKED_LINE.format(clinic=top.clinic.name, slot=spoken_slot(slot)))
-            await orchestrator.book()
+            # The yes was to this slot, so a slot outside their time books too.
+            await orchestrator.book(any_time=self._other_time)
         else:
             await self._say(NO_SLOT_LINE if command == SpokenCommand.YES_BOOK else SAVED_LINE)
             await orchestrator.save()
@@ -712,6 +783,8 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
     def set_away(away: bool) -> None:
         # While stepped away, call lines go out as text only: no TTS spent, and the calls run faster.
         record.voice = voice and not away
+        if away and orchestrator is not None and run is not None and not run.done():
+            orchestrator.stepped_away = True  # her callback says how many calls she made meanwhile
         if session is not None and session.phase == "calls":
             if away:
                 session.stop_listening()
@@ -781,6 +854,9 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
                     if session is None:
                         session = new_session("over")  # Watch: a session just for the booking answer
                     session._spawn(session.callback(run, orchestrator))
+            elif isinstance(msg, BargeIn):
+                if session is None or not session.barge_in():
+                    log.info("case=%s barge-in ignored: Lana isn't talking to the patient", case_id)
             elif isinstance(msg, Command) and msg.name in ("step_away", "step_back"):
                 set_away(msg.name == "step_away")
             elif isinstance(msg, Stop):

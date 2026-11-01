@@ -6,8 +6,8 @@
       "distance_mi": 3.1,
       "rating": 4.9,
       "review_count": 412,
-      "hours": "Mon-Thu 8am-7pm, Fri 8am-3pm",
-      "review_summary": "Patients love the evening appointments, the warm front desk and how clearly the doctor explains treatment. A few say it costs more than nearby offices.",
+      "hours": "Mon-Thu 10am-7pm, Fri 10am-3pm, Sat 9am-12pm",
+      "review_summary": "Patients love the evening and Saturday appointments, the warm front desk and how clearly the doctor explains treatment. A few say it costs more than nearby offices.",
       "phone": "555-0101",
       "is_demo": true,
       "voice_id": "VOICE_CLINIC_1"
@@ -18,7 +18,12 @@
       "consult_fee": 0,
       "monthly": 180,
       "down_payment": 1000,
-      "includes": ["braces", "all adjustments", "1 set of retainers", "emergency visits"],
+      "includes": [
+        "braces",
+        "all adjustments",
+        "1 set of retainers",
+        "emergency visits"
+      ],
       "floor_price": 3990,
       "will_price_match": true,
       "will_waive_records": true,
@@ -26,19 +31,24 @@
       "will_add_retainers": true,
       "open_slots": [
         {
-          "day_offset": 4,
+          "weekday": "tuesday",
           "time": "17:30"
         },
         {
-          "day_offset": 6,
+          "weekday": "thursday",
           "time": "18:00"
         },
         {
-          "day_offset": 7,
-          "time": "08:30"
+          "weekday": "saturday",
+          "time": "09:00"
         }
       ],
-      "personality": "Friendly and chatty, but always checks with a manager before matching a price or giving a discount."
+      "personality": "Friendly and chatty, but always checks with a manager before matching a price or giving a discount.",
+      "facts": [
+        "Two of the assistants speak Spanish, and forms come in Spanish too.",
+        "The office offers Invisalign clear aligners as well as braces, for about the same price.",
+        "For a patient under 18, a parent or guardian signs the plan and can make the payments."
+      ]
     }
   },
   {
@@ -49,7 +59,7 @@
       "rating": 4.6,
       "review_count": 238,
       "hours": "Mon-Fri 7am-4pm",
-      "review_summary": "Known for low, upfront prices and quick visits. Some reviewers mention the office feels rushed and there are no after-work appointments.",
+      "review_summary": "Known for low, upfront prices, early morning visits and quick appointments. Some reviewers mention the office feels rushed and there are no after-work appointments.",
       "phone": "555-0102",
       "is_demo": true,
       "voice_id": "VOICE_CLINIC_2"
@@ -60,7 +70,10 @@
       "consult_fee": 0,
       "monthly": 175,
       "down_payment": 500,
-      "includes": ["braces", "adjustments"],
+      "includes": [
+        "braces",
+        "adjustments"
+      ],
       "floor_price": 4050,
       "will_price_match": false,
       "will_waive_records": false,
@@ -68,19 +81,24 @@
       "will_add_retainers": false,
       "open_slots": [
         {
-          "day_offset": 1,
+          "weekday": "monday",
           "time": "07:30"
         },
         {
-          "day_offset": 5,
-          "time": "10:00"
+          "weekday": "wednesday",
+          "time": "08:30"
         },
         {
-          "day_offset": 6,
-          "time": "14:00"
+          "weekday": "friday",
+          "time": "10:00"
         }
       ],
-      "personality": "Brisk and busy, gives short answers, and wants to wrap up the call quickly."
+      "personality": "Brisk and busy, gives short answers, and wants to wrap up the call quickly.",
+      "facts": [
+        "There is no sedation, but the doctor uses numbing gel and gives wax and a comfort kit for sore days.",
+        "The office only does metal and ceramic braces, no clear aligners.",
+        "A parent or guardian can set up and pay the plan for a patient under 18."
+      ]
     }
   },
   {
@@ -102,7 +120,11 @@
       "consult_fee": 0,
       "monthly": 190,
       "down_payment": 800,
-      "includes": ["braces", "adjustments", "1 set of retainers"],
+      "includes": [
+        "braces",
+        "adjustments",
+        "1 set of retainers"
+      ],
       "floor_price": 4300,
       "will_price_match": false,
       "will_waive_records": false,
@@ -114,15 +136,24 @@
           "time": "09:30"
         },
         {
-          "day_offset": 5,
-          "time": "15:00"
-        },
-        {
           "weekday": "saturday",
           "time": "11:00"
+        },
+        {
+          "weekday": "wednesday",
+          "time": "14:00"
+        },
+        {
+          "weekday": "thursday",
+          "time": "15:30"
         }
       ],
-      "personality": "Polite and patient, but says no to most discounts and sticks to the listed price."
+      "personality": "Polite and patient, but says no to most discounts and sticks to the listed price.",
+      "facts": [
+        "The office offers Invisalign clear aligners, usually a few hundred dollars more than braces.",
+        "Many patients are teens, and parents can pay with the monthly plan.",
+        "For nervous patients the team does a slow first visit and can use numbing gel; there is no sedation."
+      ]
     }
   }
 ]

@@ -4,6 +4,8 @@ Python decides what Lana asks next (the first missing field) and when the call e
 The model only phrases the question and answers the receptionist from the patient's
 Preferences. The opening price question is Python's: one of a few wordings, never the one
 the last call used, so each call sounds a little different and starts without a model call.
+Python also says the slot question when the patient wants a time of day ("Do you have any
+morning openings next week?"), and at most one question from the patient's notes per call.
 """
 
 import inspect
@@ -17,6 +19,7 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 from app.agent.extractor import CHECKLIST_ORDER, Transcript, TranscriptLine, update_checklist
+from app.agent.intake import NOTE_TOPICS
 from app.config import get_settings
 from app.data.loader import get_public_clinics
 from app.integrations.meta_llm import stream_chat
@@ -47,6 +50,26 @@ FALLBACK_QUESTIONS = {
     "next_slots": "When is your next available consult appointment?",
     "evening_hours": "Do you have any evening appointments?",
 }
+
+# The slot question when the patient wants a time of day.
+TIME_SLOT_QUESTION = "Do you have any {time} openings next week?"
+# The second ask, when the first got no slot (often "none in the evenings"): any time at all,
+# so the patient can be told honestly what the earliest one is.
+TIME_SLOT_AGAIN = "Okay. What's your earliest opening at any time, then?"
+
+# The one question from the patient's notes, by NOTE_TOPICS key. {language} is from the note.
+NOTE_FIELD = "note"
+NOTE_QUESTIONS = {
+    "language": "Does anyone at your office speak {language}?",
+    "minor": "Can a parent or guardian set up and pay the plan for a patient under 18?",
+    "comfort": "The patient is a little nervous about pain. What do you do to keep patients comfortable?",
+    "aligners": "Do you also offer clear aligners?",
+}
+OTHER_LANGUAGES = "a language other than English"
+_LANGUAGES = (
+    "spanish", "vietnamese", "chinese", "mandarin", "cantonese", "korean", "arabic", "hindi", "urdu",
+    "french", "portuguese", "tagalog",
+)
 
 # The opening question when total_price is asked first. {treatment} is what the patient wants.
 OPENING_QUESTIONS = (
@@ -94,8 +117,23 @@ def _patient_text(prefs: Preferences) -> str:
             f"- Already has a treatment plan: {_yes_no(prefs.has_plan)}",
             f"- Must-haves: {', '.join(prefs.must_haves) or 'none given'}",
             f"- Free times: {', '.join(prefs.free_times) or 'not given'}",
+            f"- Preferred appointment time: {prefs.time_pref}",
+            f"- Notes from the patient: {'; '.join(prefs.notes) or 'none'}",
         ]
     )
+
+
+def note_question(notes: list[str]) -> str | None:
+    """The question for the most important note a clinic can answer, or None."""
+    for topic, pattern in NOTE_TOPICS.items():
+        note = next((n for n in notes if pattern.search(n)), None)
+        if note is None:
+            continue
+        if topic == "language":
+            word = next((w for w in _LANGUAGES if re.search(rf"\b{w}\b", note, re.IGNORECASE)), None)
+            return NOTE_QUESTIONS[topic].format(language=word.capitalize() if word else OTHER_LANGUAGES)
+        return NOTE_QUESTIONS[topic]
+    return None
 
 
 def opening_lines() -> list[str]:
@@ -179,7 +217,9 @@ class Caller:
         self.on_checklist = on_checklist
         self.checklist = ClinicChecklist()
         self.transcript = Transcript(call_id=call_id or uuid.uuid4().hex[:12], clinic_id=clinic.id)
-        self._asks = dict.fromkeys(CHECKLIST_ORDER, 0)
+        self._asks = dict.fromkeys([*CHECKLIST_ORDER, NOTE_FIELD], 0)
+        # A must-have like "spanish speaking" is a question a clinic can answer too.
+        self._note_question = note_question([*preferences.notes, *preferences.must_haves])
         self._lana_turns = 0
         self._clock = 0.0
         self._agent_name = get_settings().agent_name
@@ -198,10 +238,10 @@ class Caller:
                     await self._say(Speaker.AGENT, CLOSING_LINE)
                 break
             if self._lana_turns == 0:
-                opening = _opening(self.preferences) if fields[0] == "total_price" else await self._question(fields)
+                opening = _opening(self.preferences) if fields[0] == "total_price" else await self._next_line(fields)
                 line = f"{DISCLOSURE.format(agent_name=self._agent_name)} {opening}"
             else:
-                line = await self._question(fields)
+                line = await self._next_line(fields)
             self._asks[fields[0]] += 1
             await self._say(Speaker.AGENT, line)
             reply = await receptionist.next_line(line)
@@ -212,11 +252,27 @@ class Caller:
     def _fields_to_ask(self) -> list[str]:
         """Missing fields from DEMO_CHECKLIST, in order. The extractor still fills the others."""
         asked = get_settings().demo_fields
-        return [
+        fields = [
             name
             for name in CHECKLIST_ORDER
             if name in asked and getattr(self.checklist, name) is None and self._asks[name] < MAX_ASKS
         ]
+        # One note question per call, asked once, after the checklist.
+        if self._note_question is not None and self._asks[NOTE_FIELD] == 0:
+            fields.append(NOTE_FIELD)
+        return fields
+
+    async def _next_line(self, fields: list[str]) -> str:
+        """Python's line for the note and for a time-of-day slot question, else the model's."""
+        if fields[0] == NOTE_FIELD:
+            self.checklist = self.checklist.model_copy(update={"note_question": self._note_question})
+            return self._note_question
+        time_pref = self.preferences.time_pref
+        if fields[0] == "next_slots" and time_pref != "any":
+            if self._asks["next_slots"]:
+                return TIME_SLOT_AGAIN
+            return TIME_SLOT_QUESTION.format(time=time_pref)
+        return await self._question([f for f in fields if f != NOTE_FIELD])
 
     async def _question(self, fields: list[str]) -> str:
         """Lana's next line from the model, or a fixed question if it fails the checks."""

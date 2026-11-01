@@ -167,3 +167,9 @@ async def test_live_parkway_never_quotes_below_floor() -> None:
     for reply in replies:
         below = [a for a in dollar_amounts(reply) if floor * simulator.PRICE_SIZED_FRACTION <= a < floor]
         assert not below, f"quoted below the ${floor:,} floor: {reply!r}"
+
+
+def test_other_facts_are_in_the_price_sheet_text() -> None:
+    sim = _parkway()
+    assert "- Other facts: Two of the assistants speak Spanish" in sim._system
+    assert "answer only from the other facts above" in sim._system

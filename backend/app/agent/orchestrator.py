@@ -10,6 +10,7 @@ import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from app.agent.caller import WORDS_PER_SECOND, Caller
 from app.agent.extractor import build_quote
 from app.agent.negotiator import MoveKind, negotiate, pick_target, plan_moves
 from app.agent.ranker import add_tradeoffs, rank_offers
-from app.agent.researcher import pick_clinics
+from app.agent.researcher import pick_clinics, slot_matches
 from app.clinics.simulator import ClinicSimulator, dollar_amounts
 from app.config import get_settings
 from app.data.loader import load_demo_clinics
@@ -42,6 +43,7 @@ from app.schemas.events import (
 )
 from app.schemas.negotiation import Concession, NegotiationResult
 from app.schemas.offer import Offer
+from app.schemas.preferences import TIME_PLURAL
 from app.schemas.quote import Quote
 
 log = logging.getLogger(__name__)
@@ -81,6 +83,13 @@ SUMMARY_TEMPLATE = "{clinic} came in at ${final:,} all in."
 SUMMARY_SAVED = " I got it down from ${first:,}, so you save ${saved:,}."
 SUMMARY_SLOT = " Their next opening is {slot}."
 NO_OFFER_SUMMARY = "I called the clinics, but none confirmed a price within what you asked for."
+# When even the best offer is over the budget, the summary says so first.
+OVER_BUDGET_SUMMARY = (
+    "Nobody would go under ${budget:,}. The best I got was ${final:,} at {clinic}, ${over:,} over your budget."
+)
+# Put in front of the summary when the patient stepped away during the calls.
+AWAY_LINE = "I made {n} call{s} while you were away."
+_GREETING_RE = re.compile(r"^\s*(?:hi|hey|hello)\b[^.!?]*[.!?]\s*", re.IGNORECASE)
 
 Emit = Callable[[BaseModel], None | Awaitable[None]]
 
@@ -108,6 +117,28 @@ def first_slot(offer: Offer) -> datetime | None:
     return min(slots.value) if slots is not None and slots.value else None
 
 
+def pick_slot(offer: Offer, time_pref: str = "any") -> tuple[datetime | None, bool]:
+    """The earliest slot in the patient's preferred time, and True.
+
+    With none in that time: the earliest slot of any time and False. With no slots: (None, False).
+    """
+    slots = offer.quote.checklist.next_slots
+    times = sorted(slots.value) if slots is not None else []
+    match = next((s for s in times if slot_matches(s, time_pref)), None)
+    if match is not None:
+        return match, True
+    return (times[0] if times else None), False
+
+
+@dataclass
+class NoMatchingSlot:
+    """book() found no slot in the patient's preferred time; nothing was booked."""
+
+    clinic_id: str
+    time_pref: str
+    earliest: datetime
+
+
 def _final_all_in(offer: Offer) -> int | None:
     return offer.negotiation.final_all_in if offer.negotiation is not None else offer.quote.all_in_price
 
@@ -127,6 +158,10 @@ def allowed_amounts(case: Case) -> set[int]:
     for deal in deals:
         amounts |= {deal.first_all_in, deal.final_all_in, deal.total_saved}
         amounts |= {c.amount for c in deal.concessions if c.amount}
+    # The budget and how far each offer is over it, for an honest over-budget summary.
+    if case.preferences is not None:
+        amounts.add(case.preferences.budget_max)
+    amounts |= {o.over_budget_by for o in case.offers if o.over_budget_by}
     return amounts
 
 
@@ -145,18 +180,34 @@ def template_summary(case: Case) -> str:
     if not case.offers or _final_all_in(case.offers[0]) is None:
         return NO_OFFER_SUMMARY
     top = case.offers[0]
-    text = SUMMARY_TEMPLATE.format(clinic=top.clinic.name, final=_final_all_in(top))
+    if top.over_budget_by and case.preferences is not None:
+        text = OVER_BUDGET_SUMMARY.format(
+            budget=case.preferences.budget_max, final=_final_all_in(top), clinic=top.clinic.name, over=top.over_budget_by
+        )
+    else:
+        text = SUMMARY_TEMPLATE.format(clinic=top.clinic.name, final=_final_all_in(top))
     if top.negotiation is not None and top.negotiation.total_saved > 0:
         text += SUMMARY_SAVED.format(first=top.negotiation.first_all_in, saved=top.negotiation.total_saved)
-    slot = first_slot(top)
-    if slot is not None:
+    slot, matches = pick_slot(top, _time_pref(case))
+    if slot is not None and matches:
         text += SUMMARY_SLOT.format(slot=spoken_slot(slot))
     return text
+
+
+def _time_pref(case: Case) -> str:
+    return case.preferences.time_pref if case.preferences is not None else "any"
 
 
 def _summary_facts(case: Case) -> str:
     top = case.offers[0]
     facts = [f"- Best clinic: {top.clinic.name}", f"- Its final all-in price: ${_final_all_in(top):,}"]
+    prefs = case.preferences
+    if top.over_budget_by and prefs is not None:
+        facts.append("- No clinic came in under the patient's budget")
+        facts.append(f"- Patient's budget: ${prefs.budget_max:,}")
+        facts.append(f"- Best clinic is over budget by: ${top.over_budget_by:,}")
+    if prefs is not None and prefs.place:
+        facts.append(f"- These are demo clinics placed near {prefs.place}, not real clinics there")
     deal = top.negotiation
     if deal is not None and deal.total_saved > 0:
         facts.append(f"- Its price before {get_settings().agent_name} negotiated: ${deal.first_all_in:,}")
@@ -165,9 +216,18 @@ def _summary_facts(case: Case) -> str:
     monthly = top.quote.checklist.monthly_payment
     if monthly is not None:
         facts.append(f"- Monthly payment: ${monthly.value:,}")
-    slot = first_slot(top)
-    if slot is not None:
-        facts.append(f"- Next opening: {spoken_slot(slot)}")
+    time_pref = _time_pref(case)
+    slot, matches = pick_slot(top, time_pref)
+    if slot is not None and matches:
+        when = f" in the patient's preferred time ({TIME_PLURAL[time_pref]})" if time_pref != "any" else ""
+        facts.append(f"- Next opening{when}: {spoken_slot(slot)}")
+    elif slot is not None:
+        # The booking question right after the summary says this; the summary leaves the slot out.
+        facts.append(f"- No opening in the patient's preferred time ({TIME_PLURAL[time_pref]}); the question after your summary covers it")
+    checklist = top.quote.checklist
+    if checklist.note_question and checklist.note_answer is not None:
+        facts.append(f"- {get_settings().agent_name} asked: {checklist.note_question}")
+        facts.append(f"- The clinic said: {checklist.note_answer.value}")
     for other in case.offers[1:]:
         price = _final_all_in(other)
         if price is not None:
@@ -249,6 +309,8 @@ class Orchestrator:
         self._step = "starting the case"
         self._sheets: dict[str, PriceSheet] = {}
         self.summary: str | None = None  # set by start_callback()
+        self.calls_made = 0  # calls dialed; resuming a held call is not a new one
+        self.stepped_away = False  # set by the server when the patient steps away during the calls
 
     # ---------- states ----------
 
@@ -384,6 +446,7 @@ class Orchestrator:
         return f"{line}, ${gap:,} {'less' if price < other else 'more'} than {_short(held.name)}"
 
     def _new_call(self, clinic: Clinic) -> _Call:
+        self.calls_made += 1
         return _Call(self, clinic, self._sheets[clinic.id])
 
     async def _set_quote(self, quote: Quote) -> None:
@@ -503,16 +566,30 @@ class Orchestrator:
         """OFFERS_READY -> CALLBACK: write Lana's summary and tell the browser to ring."""
         self._step = "writing the summary"
         await self.advance(S.CALLBACK)
-        self.summary = await write_summary(self.case)
+        summary = await write_summary(self.case)
+        if self.stepped_away and self.calls_made:
+            # "I made 3 calls while you were away." comes first, before any "Hi, it's Lana."
+            away = AWAY_LINE.format(n=self.calls_made, s="s" if self.calls_made != 1 else "")
+            summary = f"{away} {_GREETING_RE.sub('', summary, count=1)}"
+        self.summary = summary
         await self._emit(CallbackStarted(case_id=self.case.id, summary=self.summary))
         return self.summary
 
-    async def book(self) -> Booked | None:
-        """CALLBACK -> BOOKED at the winner's first open slot. None if it gave no slot."""
+    async def book(self, any_time: bool = False) -> Booked | NoMatchingSlot | None:
+        """CALLBACK -> BOOKED at the winner's earliest slot in the patient's preferred time.
+
+        If none is in that time, nothing is booked and NoMatchingSlot says what the earliest is;
+        any_time=True (the patient said yes to that slot) books it. None if the clinic gave no slot.
+        """
         top = self.case.offers[0] if self.case.offers else None
-        slot = first_slot(top) if top is not None else None
-        if top is None or slot is None:
+        if top is None:
             return None
+        time_pref = _time_pref(self.case)
+        slot, matches = pick_slot(top, time_pref)
+        if slot is None:
+            return None
+        if not matches and not any_time:
+            return NoMatchingSlot(clinic_id=top.clinic.id, time_pref=time_pref, earliest=slot)
         deal = top.negotiation
         saved = deal.total_saved if deal is not None and deal.clinic_id == top.clinic.id else 0
         await self.advance(S.BOOKED)

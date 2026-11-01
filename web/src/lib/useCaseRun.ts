@@ -23,7 +23,7 @@ export interface ListenState {
   partial: string;
   /** The patient's last finished turn. */
   heard: string | null;
-  /** Between the patient's turn and Lana's reply. */
+  /** Between the patient's turn and Lana's reply. Shown, never filled with spoken filler words. */
   thinking: boolean;
   lanaSpeaking: boolean;
   /** The question Lana asked last; null before the first one and once intake is done. */
@@ -89,6 +89,9 @@ function listenReducer(state: ListenState, action: ListenAction): ListenState {
       return { ...state, partial: "", heard: e.text, thinking: !state.done || state.callback };
     case "agent_said":
       return e.call_id === null ? { ...state, thinking: false } : state;
+    case "command":
+      // Start over or a step away: no reply from Lana follows.
+      return { ...state, thinking: false };
     case "intake":
       return { ...state, topic: e.topic, done: e.done, draft: e.draft, preferences: e.preferences ?? state.preferences };
     case "stt_unavailable":
@@ -123,8 +126,24 @@ export function useCaseRun(onStartOver?: () => void): {
   const player = useRef<Player | null>(null);
   const mic = useRef<Mic | null>(null);
   const lanaSpeaking = useRef(false);
+  /** Lana's current line is to the patient, so the mic is armed for barge-in rather than paused. */
+  const lanaToPatient = useRef(false);
   const startOver = useRef(onStartOver);
   startOver.current = onStartOver;
+
+  /** The patient talked over Lana: stop her here and tell the server, which cuts her line. */
+  const bargeIn = useCallback(() => {
+    if (player.current?.bargeIn()) socket.current?.send({ type: "barge_in" });
+  }, []);
+
+  /** Mute the mic for Lana's line: armed for barge-in when she talks to the patient, else paused. */
+  const quietFor = useCallback(
+    (m: Mic) => {
+      if (lanaToPatient.current) m.arm(bargeIn);
+      else m.pause();
+    },
+    [bargeIn],
+  );
 
   const stopMic = useCallback(() => {
     mic.current?.stop();
@@ -163,10 +182,11 @@ export function useCaseRun(onStartOver?: () => void): {
           if (event.type === "command" && event.name === "step_away") goAway();
         },
         reveal: (seq, count) => dispatch({ kind: "reveal", seq, count }),
-        speaking: (on) => {
+        speaking: (on, toPatient) => {
           lanaSpeaking.current = on;
-          if (on) mic.current?.pause();
-          else mic.current?.resume();
+          lanaToPatient.current = on && toPatient;
+          if (on && mic.current) quietFor(mic.current);
+          else if (!on) mic.current?.resume();
           listenDispatch({ kind: "speaking", on });
         },
       });
@@ -199,7 +219,7 @@ export function useCaseRun(onStartOver?: () => void): {
       s.open();
       return s;
     },
-    [stop, stopMic, goAway],
+    [stop, stopMic, goAway, quietFor],
   );
 
   const start = useCallback(
@@ -219,7 +239,7 @@ export function useCaseRun(onStartOver?: () => void): {
         (m) => {
           if (socket.current !== s) return m.stop(); // started over while the mic was asked for
           mic.current = m;
-          if (lanaSpeaking.current) m.pause();
+          if (lanaSpeaking.current) quietFor(m);
           listenDispatch({ kind: "mic", mic: "on" });
         },
         () => {
@@ -227,7 +247,7 @@ export function useCaseRun(onStartOver?: () => void): {
         },
       );
     },
-    [open],
+    [open, quietFor],
   );
 
   const sendText = useCallback((text: string) => {
@@ -266,13 +286,13 @@ export function useCaseRun(onStartOver?: () => void): {
         (m) => {
           if (socket.current !== s) return m.stop();
           mic.current = m;
-          if (lanaSpeaking.current) m.pause();
+          if (lanaSpeaking.current) quietFor(m);
           listenDispatch({ kind: "mic", mic: "on" });
         },
         () => listenDispatch({ kind: "mic", mic: "off", fallback: true }),
       );
     });
-  }, [sendAudio]);
+  }, [sendAudio, quietFor]);
 
   // A Watch run started (the patient said "just show me"): the mic's job is done. After the
   // patient's own intake it stays open, so they can say "I'll wait".

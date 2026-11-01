@@ -1,10 +1,11 @@
 """Intake: Lana's short chat that turns what the patient says into Preferences.
 
 Each turn the model reads the whole conversation and the draft, and returns what the patient
-said, which topics they addressed, and Lana's next line. Python still owns the rules: it
-merges the values (budget, pay in full, cities, defaults), checks her line, falls back to a
-fixed question from prompts/intake.md when the line fails a check, and decides when intake
-is done.
+said (fields and short notes of anything else that matters), which topics they addressed, and
+Lana's next line. Python still owns the rules: it merges the values (budget, monthly amounts,
+pay in full, cities, defaults), checks her line, asks the model once more with the reason when
+the line fails a check, falls back to a fixed question from prompts/intake.md when that fails
+too, and decides when intake is done.
 """
 
 import difflib
@@ -17,7 +18,7 @@ from pydantic import BaseModel, Field
 from app.config import get_settings
 from app.integrations.meta_llm import call_json
 from app.schemas.enums import Treatment
-from app.schemas.preferences import Preferences
+from app.schemas.preferences import TIME_PLURAL, Preferences, TimePref
 
 log = logging.getLogger(__name__)
 
@@ -25,8 +26,38 @@ PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "intake.md"
 PROMPT_SPLIT = "<!-- lines -->"
 
 MAX_QUESTIONS = 6
-INTAKE_REASONING = "low"
 MAX_REPLY_SENTENCES = 2
+# Added to the prompt when Lana's line fails a check: the model gets one more try.
+RETRY_PROMPT = (
+    '\n\n## Your last reply was rejected\n\nYou wrote: "{reply}"\nIt can\'t be said because: {problem}.\n'
+    "Return the same updates, with a new reply that fixes this."
+)
+
+# Notes: short plain phrases, a few at most.
+MAX_NOTES = 5
+MAX_NOTE_WORDS = 10
+# Notes a clinic can answer on the phone, most important first. The caller asks about the
+# first one found, once per call.
+NOTE_TOPICS: dict[str, re.Pattern[str]] = {
+    "language": re.compile(
+        r"\b(spanish|vietnamese|chinese|mandarin|cantonese|korean|arabic|hindi|urdu|french|portuguese|"
+        r"tagalog|language|speak(?:s|ing|ers?)?)\b",
+        re.IGNORECASE,
+    ),
+    "minor": re.compile(
+        r"\b(son|daughter|kids?|child(?:ren)?|teen(?:ager)?s?|minor|grand(?:son|daughter)|\d+[- ]year[- ]old)\b",
+        re.IGNORECASE,
+    ),
+    "comfort": re.compile(r"\b(pain|painful|hurts?|nervous|anxious|anxiety|scared|afraid|sedat\w*)\b", re.IGNORECASE),
+    "aligners": re.compile(r"\b(aligners?|invisalign)\b", re.IGNORECASE),
+}
+# A must-have that names a time of day sets time_pref when the patient gave none.
+_TIME_MUST_RE = {
+    "morning": re.compile(r"\bmornings?\b", re.IGNORECASE),
+    "afternoon": re.compile(r"\bafternoons?\b", re.IGNORECASE),
+    "evening": re.compile(r"\b(evenings?|after work|nights?)\b", re.IGNORECASE),
+    "weekend": re.compile(r"\b(weekends?|saturdays?|sundays?)\b", re.IGNORECASE),
+}
 
 # The main DFW cities and a ZIP for each. A city without a ZIP gets its ZIP here; a place
 # that matches none of them gets DEFAULT_ZIP (Arlington).
@@ -66,6 +97,8 @@ SPELLING_CUTOFF = 0.8
 SOUND_CUTOFF = 0.85
 SOUND_MIN_SPELLING = 0.4
 SOUND_MIN_KEY = 4
+# A spelling match also needs a similar length, so "Francisco" never shrinks into "Frisco".
+SPELLING_MAX_LENGTH_GAP = 2
 _SOUND_MAP = str.maketrans({"g": "k", "q": "k", "c": "k", "d": "t", "b": "p", "v": "f", "z": "s", "x": "s"})
 DEFAULT_DISTANCE_MI = 15.0
 # A skipped budget means no cap in practice; every demo clinic lists well under this.
@@ -79,7 +112,7 @@ TOPIC_FIELDS: dict[str, tuple[str, ...]] = {
     "budget": ("budget_max",),
     "pay": ("prefers_monthly", "pay_in_full_ok", "uses_hsa_fsa"),
     "records": ("has_xrays", "has_plan"),
-    "must_haves": ("must_haves",),
+    "must_haves": ("must_haves", "time_pref"),
 }
 IMPORTANT = ("treatment", "location", "budget")
 TOPIC_HINTS = {
@@ -88,7 +121,7 @@ TOPIC_HINTS = {
     "budget": "the most they want to spend in total",
     "pay": "monthly, in full if cheaper, or with an HSA or FSA",
     "records": "whether they already have x-rays or a treatment plan",
-    "must_haves": "anything a clinic must have, like evening hours",
+    "must_haves": "anything a clinic must have, or a time of day that works, like mornings",
 }
 
 # "Near me" answers must-haves: a short distance, and "close by" for the ranker and the calls.
@@ -114,6 +147,12 @@ _ADVICE_RE = re.compile(
     r"|\bsounds like you need\b"
 )
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+# Praise Lana never opens with: "Perfect, which city?" is said as "Which city?".
+_PRAISE_RE = re.compile(
+    r"^\s*(?:(?:oh|ok|okay),?\s+)?(?:(?:perfect|great|awesome|wonderful|excellent|fantastic|amazing|"
+    r"that'?s (?:good|great|perfect|awesome|wonderful)|sounds (?:good|great|perfect))\b[!.,]*\s*)+",
+    re.IGNORECASE,
+)
 _MEDICAL_RE = re.compile(
     r"\b(do i (really |even |actually )?need|should i (get|do)|is (it|my \w+) (bad|severe|serious)|"
     r"how bad (is|are)|are my teeth)\b"
@@ -155,6 +194,8 @@ class PreferencesDraft(BaseModel):
     has_plan: bool | None = None
     must_haves: list[str] | None = None
     free_times: list[str] | None = None
+    time_pref: TimePref | None = None
+    notes: list[str] | None = None
 
 
 class _Heard(BaseModel):
@@ -165,6 +206,8 @@ class _Heard(BaseModel):
     city: str | None = None
     max_distance_mi: float | None = None
     budget: int | str | None = Field(default=None, description="Total budget in the patient's words")
+    monthly_max: int | str | None = Field(default=None, description="Most per month, in the patient's words")
+    time_pref: TimePref | None = None
     prefers_monthly: bool | None = None
     pay_in_full_ok: bool | None = None
     uses_hsa_fsa: bool | None = None
@@ -178,6 +221,7 @@ class _Turn(BaseModel):
     """What the model returns for one turn: what was said, and Lana's next line."""
 
     updates: _Heard = Field(default_factory=_Heard)
+    notes: list[str] = Field(default_factory=list, description="Short notes of anything else that matters")
     answered: list[str] = Field(default_factory=list, description="Topics the patient addressed")
     asking: str | None = Field(default=None, description="The missing topic the reply asks about")
     reply: str = ""
@@ -198,13 +242,21 @@ def _prompts() -> tuple[str, dict[str, str]]:
     return prompt.strip(), fixed
 
 
-def fillers() -> list[str]:
-    """Lana's short fillers ("Got it.", "Mm-hm."), said while the model works on her reply."""
-    return [f.strip() for f in _prompts()[1]["fillers"].split("|") if f.strip()]
+def note_topic(note: str) -> str | None:
+    """The NOTE_TOPICS key a clinic could answer for this note, or None."""
+    return next((topic for topic, pattern in NOTE_TOPICS.items() if pattern.search(note)), None)
 
 
 def _norm(line: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", line.lower()).strip()
+
+
+def strip_praise(reply: str) -> str:
+    """The reply without a leading praise word, capitalized again."""
+    rest = _PRAISE_RE.sub("", reply.replace("’", "'"), count=1).strip()
+    if rest == reply.replace("’", "'").strip():
+        return reply.strip()
+    return rest[:1].upper() + rest[1:]
 
 
 def reply_problem(reply: str, previous: str | None) -> str | None:
@@ -231,13 +283,16 @@ def _question_part(reply: str) -> str:
 
 
 def _words_to_int(text: str) -> int | None:
-    """'five thousand five hundred' -> 5500. Reads the first run of number words only."""
-    total, current, seen = 0, 0, False
+    """'five thousand five hundred' -> 5500, 'two fifty' -> 250. Reads the first run of number words only."""
+    total, current, seen, last_unit = 0, 0, False, False
     for word in re.findall(r"[a-z]+", text):
+        unit = False
         if word in _UNITS:
             current += _UNITS[word]
+            unit = 0 < _UNITS[word] < 10
         elif word in _TENS:
-            current += _TENS[word]
+            # "two fifty" said as a price is 250.
+            current = current * 100 + _TENS[word] if last_unit and current < 10 else current + _TENS[word]
         elif word == "hundred":
             current = (current or 1) * 100
         elif word in ("thousand", "grand", "k"):
@@ -249,7 +304,7 @@ def _words_to_int(text: str) -> int | None:
             if seen:
                 break
             continue
-        seen = True
+        seen, last_unit = True, unit
     return total + current if seen else None
 
 
@@ -306,7 +361,7 @@ def match_city(text: str) -> tuple[str, str, bool] | None:
             spelling = _ratio(gram, name.lower())
             city_sound = _sound(name)
             sound = _ratio(gram_sound, city_sound)
-            close = spelling >= SPELLING_CUTOFF or (
+            close = (spelling >= SPELLING_CUTOFF and abs(len(gram) - len(name)) <= SPELLING_MAX_LENGTH_GAP) or (
                 sound >= SOUND_CUTOFF
                 and spelling >= SOUND_MIN_SPELLING
                 and min(len(gram_sound), len(city_sound)) >= SOUND_MIN_KEY
@@ -332,6 +387,12 @@ def _clean_list(items: list[str] | None) -> list[str] | None:
     return [item.strip() for item in items if item.strip()]
 
 
+def _clean_note(note: str) -> str:
+    """A note as a short plain phrase: no dashes or end punctuation, at most MAX_NOTE_WORDS words."""
+    note = re.sub(r"\s*[—–]\s*", ", ", note).strip().strip(".!?;,").strip()
+    return " ".join(note.split()[:MAX_NOTE_WORDS])
+
+
 def _says_pay_in_full(text: str) -> bool:
     return bool(_PAY_IN_FULL_RE.search(text)) and not _PAY_IN_FULL_NOT_RE.search(text)
 
@@ -346,6 +407,7 @@ class Intake:
         self.misses: dict[str, int] = dict.fromkeys(TOPIC_FIELDS, 0)
         self.done = False
         self._fuzzy_city: str | None = None  # a city fuzzy-matched from this reply, for Lana to confirm
+        self._told_demo_place = False  # Lana has said the demo clinics are placed near an outside place
         self._prompt, self._lines = _prompts()
         # The whole chat as (speaker, text), starting with the greeting Lana actually said.
         self.history: list[tuple[str, str]] = [("lana", greeting or self.first_line())]
@@ -357,6 +419,19 @@ class Intake:
         return topic in self.answered or any(
             getattr(self.draft, name) is not None for name in TOPIC_FIELDS[topic]
         )
+
+    def outside_place(self) -> str | None:
+        """The place the patient named if it isn't one of the DFW cities, as they said it."""
+        city = self.draft.city
+        return city if city and match_city(city) is None else None
+
+    def _demo_place_lead(self) -> str:
+        """Lana's one-time line that the demo clinics are placed near an outside place."""
+        place = self.outside_place()
+        if place is None or self._told_demo_place:
+            return ""
+        self._told_demo_place = True
+        return self._lines["demo_place"].format(place=place) + " "
 
     def missing(self) -> list[str]:
         """Unanswered topics, the important ones first."""
@@ -405,11 +480,13 @@ class Intake:
             previous=previous or "None.",
             turns_left=max(0, MAX_QUESTIONS - self.asked),
         )
-        turn = await call_json(prompt, _Turn, settings.model_fast, reasoning=INTAKE_REASONING)
+        model = settings.intake_model or settings.model_fast
+        turn = await call_json(prompt, _Turn, model, reasoning=settings.intake_reasoning)
 
         medical = turn.medical_question or bool(_MEDICAL_RE.search(lowered))
         self._fuzzy_city = None
         filled = self._merge(turn.updates, lowered, medical)
+        filled += self._merge_notes(turn.notes)
         filled = list(dict.fromkeys(filled + self._mark_answered(turn, lowered, asked, medical)))
 
         default = ""
@@ -425,6 +502,7 @@ class Intake:
         important = [t for t in IMPORTANT if t in missing]
         allowed = important or missing
         lead = self._lines["no_advice"] + " " if medical else ""
+        lead += self._demo_place_lead()
         # A question repeated after the no-advice line is the same question, not a new one.
         repeat = medical and asked in missing
         out_of_turns = self.asked >= MAX_QUESTIONS and not repeat
@@ -438,14 +516,26 @@ class Intake:
             # The confirmation names the place, so a fuzzy city needs no separate check.
             return IntakeTurn(filled=filled, done=True, spoken=spoken)
 
-        reply = turn.reply.strip().strip('"').strip()
-        problem = None if turn.asking in allowed else f"asks about {turn.asking!r}, allowed {allowed}"
-        problem = problem or reply_problem(reply, previous)
+        asking = turn.asking
+        reply = strip_praise(turn.reply.strip().strip('"').strip())
+        problem = self._problem(asking, reply, allowed, previous)
+        if problem is not None and not medical and not repeat:
+            # One more try, with the reason, before the fixed question.
+            log.info("intake reply rejected (%s), asking the model again: %r", problem, reply)
+            retry = await call_json(
+                prompt + RETRY_PROMPT.format(reply=reply, problem=problem),
+                _Turn,
+                model,
+                reasoning=settings.intake_reasoning,
+            )
+            asking = retry.asking
+            reply = strip_praise(retry.reply.strip().strip('"').strip())
+            problem = self._problem(asking, reply, allowed, previous)
         from_model = False
         if repeat:
             topic, question = asked, self._fixed(asked, None)
         elif problem is None and not medical:
-            topic, question, from_model = turn.asking, reply, True
+            topic, question, from_model = asking, reply, True
         else:
             if not medical:
                 log.info("intake fell back to the fixed question (%s): %r", problem, reply)
@@ -465,6 +555,26 @@ class Intake:
             spoken = lead + default + question
         self.history.append(("lana", spoken))
         return IntakeTurn(filled=filled, next_question=question, spoken=spoken)
+
+    def _problem(self, asking: str | None, reply: str, allowed: list[str], previous: str | None) -> str | None:
+        """Why the model's line can't be said, in words the model can act on, or None."""
+        if asking not in allowed:
+            if asking in TOPIC_FIELDS:
+                return f'it asks about "{asking}", which is answered or not next; ask about one of: {", ".join(allowed)}'
+            return f"it must ask about one of: {', '.join(allowed)}, and set asking to that topic"
+        return reply_problem(reply, previous)
+
+    def _merge_notes(self, notes: list[str]) -> list[str]:
+        """Add the model's new notes to the draft: earlier notes stay, repeats are dropped."""
+        kept = list(self.draft.notes or [])
+        for note in notes:
+            note = _clean_note(note)
+            if note and _norm(note) not in {_norm(n) for n in kept} and len(kept) < MAX_NOTES:
+                kept.append(note)
+        if kept == (self.draft.notes or []):
+            return []
+        self.draft.notes = kept
+        return ["notes"]
 
     def _mark_answered(self, turn: _Turn, text: str, asked: str | None, medical: bool) -> list[str]:
         """Topics the patient addressed without a value: the model's list, "near me", "nothing", "skip"."""
@@ -544,9 +654,27 @@ class Intake:
             if items is not None:
                 updates[name] = items
 
+        if heard.time_pref is not None:
+            updates["time_pref"] = heard.time_pref
+        elif self.draft.time_pref is None:
+            # "Morning hours" as a must-have is a time preference too.
+            musts = " ".join(updates.get("must_haves") or self.draft.must_haves or [])
+            derived = next((t for t, pattern in _TIME_MUST_RE.items() if pattern.search(musts)), None)
+            if derived is not None:
+                updates["time_pref"] = derived
+
         changed = [name for name, value in updates.items() if getattr(self.draft, name) != value]
         for name in changed:
             setattr(self.draft, name, updates[name])
+
+        if heard.monthly_max is not None:
+            monthly = parse_budget(heard.monthly_max)
+            if monthly:
+                # A monthly cap is not a total budget: it means monthly payments, noted with the amount.
+                if self.draft.prefers_monthly is not True:
+                    self.draft.prefers_monthly = True
+                    changed.append("prefers_monthly")
+                changed += self._merge_notes([f"up to ${monthly:,} a month"])
         return changed
 
     def _confirmation(self) -> str:
@@ -560,8 +688,15 @@ class Intake:
         parts = [f"{treatment} near {place}" if place else treatment]
         if self.draft.budget_max is not None:
             parts.append(f"under ${self.draft.budget_max:,}")
-        parts.extend(prefs.must_haves)
-        return self._lines["confirm"].format(summary=", ".join(parts))
+        if prefs.time_pref != "any":
+            parts.append(TIME_PLURAL[prefs.time_pref])
+        # "Morning hours" is already said as "mornings".
+        timed = prefs.time_pref != "any"
+        parts.extend(m for m in prefs.must_haves if not (timed and _TIME_MUST_RE[prefs.time_pref].search(m)))
+        # At most one note: one a clinic can answer if there is one.
+        note = next((n for n in prefs.notes if note_topic(n)), prefs.notes[0] if prefs.notes else None)
+        noted = self._lines["confirm_note"].format(note=note) + " " if note else ""
+        return self._lines["confirm"].format(summary=", ".join(parts), noted=noted)
 
     def to_preferences(self) -> Preferences:
         """The draft as Preferences, with the conservative default for anything not said."""
@@ -578,4 +713,7 @@ class Intake:
             has_plan=bool(d.has_plan),
             must_haves=d.must_haves or [],
             free_times=d.free_times or [],
+            time_pref=d.time_pref or "any",
+            notes=d.notes or [],
+            place=self.outside_place(),
         )

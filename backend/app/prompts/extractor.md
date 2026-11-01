@@ -24,6 +24,7 @@ Today is {today}. The clinic is in the {timezone} time zone.
 - next_slots: the consult appointment times the clinic offered, as local ISO datetimes without a time zone offset, for example "2026-10-30T07:30:00". Work out the date from today's date.
 - evening_hours: true if the clinic offers evening or after-work appointments, false if it says it does not.
 - needs_exam_first: true if the clinic says it must examine the patient before giving a price.
+- note_answer: the clinic's answer to this question from Lana: {note_question} Give it as a few plain words that keep the clinic's meaning, for example "Yes, two assistants speak Spanish" or "No sedation, but numbing gel and a comfort kit". null if Lana didn't ask it, or the clinic didn't answer it, was unsure, or said it would need to check.
 
 ## Rules
 

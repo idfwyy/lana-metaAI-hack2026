@@ -15,3 +15,4 @@ class Offer(BaseModel):
     score: float = Field(ge=0, le=1)
     tradeoffs: list[str] = Field(default_factory=list)
     unknowns: list[str] = Field(default_factory=list)
+    over_budget_by: int = Field(default=0, ge=0, description="Dollars over the patient's budget; 0 if within it or unknown")

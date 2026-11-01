@@ -91,6 +91,15 @@ export function Done({ offers, outcome, onStartOver }: Props) {
           </motion.span>
         </p>
       )}
+      {top.over_budget_by > 0 && (
+        <motion.p
+          {...enter(0.22)}
+          className="mt-3 inline-flex items-center gap-2 rounded-full bg-accent-soft px-3 py-1.5 text-[14px] font-medium text-ink"
+        >
+          <span className="size-1.5 rounded-full bg-accent" aria-hidden />
+          Over your budget by <span className="font-mono tnum">{money(top.over_budget_by)}</span>
+        </motion.p>
+      )}
 
       <motion.div {...enter(0.28)} className="mt-10">
         {negotiation ? (
@@ -188,6 +197,9 @@ function OtherOffers({ offers }: { offers: Offer[] }) {
                     )}
                     {o.unknowns.length > 0 && (
                       <p className="mt-1.5 text-[13px] text-muted">Not confirmed: {o.unknowns.map(humanize).join(", ")}.</p>
+                    )}
+                    {o.over_budget_by > 0 && (
+                      <p className="mt-1.5 text-[13px] text-ink">Over your budget by {money(o.over_budget_by)}</p>
                     )}
                   </div>
                   <span className="font-mono text-[15px] text-ink tnum">{price !== null ? money(price) : "Not confirmed"}</span>

@@ -12,8 +12,12 @@ from app.agent.orchestrator import (
     RESUME_CLOSE_LINE,
     RESUME_LINE,
     IllegalTransition,
+    NoMatchingSlot,
     Orchestrator,
+    _summary_facts,
+    pick_slot,
     spoken_slot,
+    summary_problem,
     template_summary,
     write_summary,
 )
@@ -553,3 +557,195 @@ async def test_log_reads_like_lana_thinking(world: World) -> None:
         "Parkway came down to $3,990, $1,060 off",
     ]
     assert len(set(logs)) == len(logs)  # nothing repeated per clinic
+
+
+# ---------- honest over-budget results, any city, step away ----------
+
+
+async def _ready_with(world: World, **prefs) -> Orchestrator:
+    _win_on_parkway(world)
+    orch = Orchestrator(Case(preferences=_prefs(**prefs)), lambda e: None)
+    await orch.run()
+    return orch
+
+
+async def test_no_offer_within_budget_summary_names_the_overage(world: World) -> None:
+    orch = await _ready_with(world, budget_max=3000)
+
+    top = orch.case.offers[0]
+    assert top.clinic.id == "parkway" and top.over_budget_by == 990  # $3,990 against $3,000
+    summary = template_summary(orch.case)
+    assert summary.startswith(
+        "Nobody would go under $3,000. The best I got was $3,990 at Parkway Orthodontics, $990 over your budget."
+    )
+    assert summary_problem(orch.case, summary) is None
+
+
+async def test_the_model_may_say_the_budget_and_the_overage(world: World, monkeypatch) -> None:
+    orch = await _ready_with(world, budget_max=3000)
+    line = "Nobody would go under $3,000. The best I got was $3,990 at Parkway, $990 over your budget."
+    prompts: list[str] = []
+
+    async def chat(messages, model, reasoning=None):
+        prompts.append(messages[0]["content"])
+        yield line
+
+    monkeypatch.setattr(orchestrator, "stream_chat", chat)
+
+    assert await write_summary(orch.case) == line
+    assert "No clinic came in under the patient's budget" in prompts[0]
+    assert "Best clinic is over budget by: $990" in prompts[0]
+
+
+async def test_within_budget_summary_is_unchanged(world: World) -> None:
+    orch = await _ready_with(world, budget_max=5000)
+
+    assert orch.case.offers[0].over_budget_by == 0
+    assert template_summary(orch.case).startswith("Parkway Orthodontics came in at $3,990 all in.")
+
+
+async def test_step_away_summary_starts_with_the_call_count(world: World, monkeypatch) -> None:
+    orch = await _ready_with(world)
+    assert orch.calls_made == 3  # three clinics; resuming Parkway's held call is not a new call
+
+    async def chat(messages, model, reasoning=None):
+        yield "Hi, it's Lana. Parkway Orthodontics came down from $5,050 to $3,990 all in."
+
+    monkeypatch.setattr(orchestrator, "stream_chat", chat)
+    orch.stepped_away = True
+
+    summary = await orch.start_callback()
+
+    assert summary == "I made 3 calls while you were away. Parkway Orthodontics came down from $5,050 to $3,990 all in."
+
+
+async def test_no_step_away_no_call_count(world: World) -> None:
+    orch = await _ready_with(world)
+
+    assert not (await orch.start_callback()).startswith("I made")
+
+
+async def test_two_clinics_make_two_calls(world: World) -> None:
+    _win_on_parkway(world)
+    orch = Orchestrator(Case(preferences=_prefs()), lambda e: None, max_clinics=2)
+    await orch.run()
+    orch.stepped_away = True
+
+    assert (await orch.start_callback()).startswith("I made 2 calls while you were away.")
+
+
+def test_researcher_labels_demo_clinics_near_an_outside_place() -> None:
+    logs: list[str] = []
+
+    picked = pick_clinics(_prefs(place="San Francisco"), on_log=logs.append)
+
+    assert [c.id for c in picked] == ["parkway", "sunrise", "lakeside"]  # the same demo clinics
+    assert logs[0] == "Found 3 demo clinics near San Francisco"
+
+
+async def test_summary_facts_say_the_clinics_are_demo_ones_near_the_place(world: World, monkeypatch) -> None:
+    orch = await _ready_with(world, place="San Francisco")
+    prompts: list[str] = []
+
+    async def chat(messages, model, reasoning=None):
+        prompts.append(messages[0]["content"])
+        yield "Parkway Orthodontics came in at $3,990 all in."
+
+    monkeypatch.setattr(orchestrator, "stream_chat", chat)
+    await write_summary(orch.case)
+
+    assert "demo clinics placed near San Francisco, not real clinics there" in prompts[0]
+
+
+# ---------- the patient's preferred time ----------
+
+
+def test_researcher_prefers_a_morning_clinic_for_a_morning_patient() -> None:
+    logs: list[str] = []
+
+    picked = pick_clinics(_prefs(must_haves=[], time_pref="morning"), on_log=logs.append)
+
+    assert picked[0].id == "sunrise"
+    assert logs[1] == "Calling Sunrise first, they have morning openings and 4.6 stars"
+
+
+def test_researcher_reads_morning_hours_as_a_must_have() -> None:
+    picked = pick_clinics(_prefs(must_haves=["morning hours"], time_pref="morning"))
+    assert picked[0].id == "sunrise"
+
+
+def test_researcher_weekend_patient_calls_the_saturday_clinic_first() -> None:
+    logs: list[str] = []
+    picked = pick_clinics(_prefs(must_haves=[], time_pref="weekend"), on_log=logs.append)
+    assert picked[0].id == "lakeside"
+    assert "weekend openings" in logs[1]
+
+
+MONDAY_MORNING = datetime(2026, 11, 2, 9, 0, tzinfo=TZ)
+TUESDAY_EVENING = datetime(2026, 11, 3, 17, 30, tzinfo=TZ)
+WEDNESDAY_EVENING = datetime(2026, 11, 4, 18, 0, tzinfo=TZ)
+
+
+def _slots(case: Case, *slots: datetime) -> None:
+    case.offers[0].quote.checklist.next_slots = _answer(list(slots), "Tuesday at 5:30", "c1", 3.0)
+
+
+async def test_book_picks_the_morning_slot_when_one_exists(world: World) -> None:
+    orch, _ = await _ready(world)
+    orch.case.preferences = orch.case.preferences.model_copy(update={"time_pref": "morning"})
+    await orch.start_callback()
+    _slots(orch.case, TUESDAY_EVENING, MONDAY_MORNING, WEDNESDAY_EVENING)
+
+    booked = await orch.book()
+
+    assert isinstance(booked, Booked)
+    assert booked.slot == MONDAY_MORNING  # not the earlier-listed evening one
+
+
+async def test_book_with_no_morning_slot_says_so_and_books_nothing(world: World) -> None:
+    orch, _ = await _ready(world)
+    orch.case.preferences = orch.case.preferences.model_copy(update={"time_pref": "morning"})
+    await orch.start_callback()
+    _slots(orch.case, WEDNESDAY_EVENING, TUESDAY_EVENING)
+
+    result = await orch.book()
+
+    assert result == NoMatchingSlot(clinic_id="parkway", time_pref="morning", earliest=TUESDAY_EVENING)
+    assert orch.case.status == S.CALLBACK
+
+    booked = await orch.book(any_time=True)  # the patient said yes to that time
+    assert isinstance(booked, Booked) and booked.slot == TUESDAY_EVENING
+    assert orch.case.status == S.BOOKED
+
+
+async def test_pick_slot_any_time_is_the_earliest(world: World) -> None:
+    orch, _ = await _ready(world)
+    _slots(orch.case, WEDNESDAY_EVENING, MONDAY_MORNING)
+    assert pick_slot(orch.case.offers[0]) == (MONDAY_MORNING, True)
+    assert pick_slot(orch.case.offers[0], "weekend") == (MONDAY_MORNING, False)
+
+
+async def test_summary_facts_name_the_preferred_time_slot_and_the_note_answer(world: World) -> None:
+    orch, _ = await _ready(world)
+    orch.case.preferences = orch.case.preferences.model_copy(update={"time_pref": "morning"})
+    _slots(orch.case, TUESDAY_EVENING, MONDAY_MORNING)
+    checklist = orch.case.offers[0].quote.checklist
+    checklist.note_question = "Does anyone at your office speak Spanish?"
+    checklist.note_answer = _answer("Yes, two assistants speak Spanish", "two of our assistants speak Spanish", "c1", 9.0)
+
+    facts = _summary_facts(orch.case)
+
+    assert "- Next opening in the patient's preferred time (mornings): Monday, November 2 at 9:00 AM" in facts
+    assert "Tuesday" not in facts
+    assert "- The clinic said: Yes, two assistants speak Spanish" in facts
+
+
+async def test_summary_leaves_out_a_slot_outside_the_preferred_time(world: World) -> None:
+    orch, _ = await _ready(world)
+    orch.case.preferences = orch.case.preferences.model_copy(update={"time_pref": "morning"})
+    _slots(orch.case, TUESDAY_EVENING)
+
+    assert "Their next opening" not in template_summary(orch.case)
+    assert "No opening in the patient's preferred time (mornings)" in _summary_facts(orch.case)
+    assert "Not confirmed" not in _summary_facts(orch.case)
+    assert "The clinic said" not in _summary_facts(orch.case)  # nothing invented without an answer

@@ -38,6 +38,9 @@ export interface ClinicChecklist {
   next_slots: SourcedAnswer<string[]> | null;
   evening_hours: SourcedAnswer<boolean> | null;
   needs_exam_first: SourcedAnswer<boolean> | null;
+  /** The one question Lana asked from the patient's notes, and the clinic's answer. */
+  note_question?: string | null;
+  note_answer?: SourcedAnswer<string> | null;
 }
 
 export interface Quote {
@@ -83,6 +86,8 @@ export interface Offer {
   score: number;
   tradeoffs: string[];
   unknowns: string[];
+  /** Dollars over the patient's budget; 0 when within it. Ranked after every offer within it. */
+  over_budget_by: number;
 }
 
 interface Base {
@@ -163,6 +168,8 @@ export interface ErrorEvent extends Base {
   code?: "limit" | "not_found" | "bad_message" | "running" | string;
 }
 
+export type TimePref = "morning" | "afternoon" | "evening" | "weekend" | "any";
+
 /** Mirrors backend/app/schemas/preferences.py. */
 export interface Preferences {
   treatment: "braces" | "aligners" | "not sure";
@@ -176,6 +183,12 @@ export interface Preferences {
   has_plan: boolean;
   must_haves: string[];
   free_times: string[];
+  /** When the patient wants appointments; "any" means they didn't say. */
+  time_pref: TimePref;
+  /** Short plain notes of anything else the patient said that matters. */
+  notes: string[];
+  /** A place outside DFW as the patient said it; the demo clinics are placed near it. */
+  place?: string | null;
 }
 
 /** What the patient has said so far (agent/intake.py PreferencesDraft); missing keys are unsaid. */
@@ -215,6 +228,8 @@ export interface AudioFrame extends Base {
   chunk_b64?: string;
   last: boolean;
   failed?: boolean;
+  /** The patient talked over this line; the rest of its audio never came. */
+  cut?: boolean;
 }
 
 export type ServerEvent =
@@ -255,4 +270,6 @@ export type ClientMessage =
   | { type: "user_text"; text: string }
   | { type: "command"; name: "step_away" | "step_back" | string }
   /** Pick up Lana's callback (auto after 3 s of ringing). */
-  | { type: "answer" };
+  | { type: "answer" }
+  /** The patient started talking over Lana; her audio is already stopped here. */
+  | { type: "barge_in" };

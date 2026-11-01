@@ -7,6 +7,9 @@ single failed marker follows the text so the browser never waits for audio that 
 
 Watch mode's demo patient speaks too: patient_line() sends a user_said marked voiced, then
 its audio in the patient voice. The real patient's own words (UserSaid via emit) are never voiced.
+
+cut() stops the line being voiced when the patient talks over Lana: no more of its chunks go
+out, and its last frame says cut: true.
 """
 
 import asyncio
@@ -36,6 +39,11 @@ class AudioBus:
         self._lock = asyncio.Lock()
         self._clinics: dict[str, Clinic] = {c.id: c for c in get_public_clinics()}
         self._call_clinic: dict[str, str] = {}
+        self._cut = False  # the line being voiced was talked over
+
+    def cut(self) -> None:
+        """The patient talked over Lana: the line in progress sends no more audio."""
+        self._cut = True
 
     async def _send(self, payload: dict) -> int:
         seq = self.record.next_seq()
@@ -88,6 +96,7 @@ class AudioBus:
         shown = event.model_copy(update={"text": strip_audio_tags(event.text)}).model_dump(mode="json")
         if isinstance(event, UserSaid):
             shown["voiced"] = True  # the browser plays it as a line
+        self._cut = False
         line_seq = await self._send(shown)
         speaker, voice_id = self._voice(event)
         audio = {"type": "audio", "line_seq": line_seq, "speaker": speaker.value}
@@ -97,6 +106,8 @@ class AudioBus:
         if voice_id is not None:
             try:
                 async for chunk in stream_speech(event.text, voice_id, speaker=speaker):
+                    if self._cut:
+                        break
                     if held is not None:
                         await self._send({**audio, "chunk_b64": base64.b64encode(held).decode("ascii"), "last": False})
                     held = chunk
@@ -107,7 +118,10 @@ class AudioBus:
                     log.warning("case=%s tts failed mid-line: %s: %s", self.record.case.id, type(err).__name__, err)
         if guard.limit_hit():
             return
-        if held is not None:
+        if self._cut:
+            # The browser already stopped this line; it shows the text without its audio.
+            await self._send({**audio, "last": True, "failed": True, "cut": True})
+        elif held is not None:
             await self._send({**audio, "chunk_b64": base64.b64encode(held).decode("ascii"), "last": True})
         else:
             await self._send({**audio, "last": True, "failed": True})

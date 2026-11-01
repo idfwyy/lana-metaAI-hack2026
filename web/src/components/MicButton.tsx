@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { motion, useReducedMotion } from "motion/react";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { Mic } from "lucide-react";
 import { EASE_OUT, ORB_MORPH } from "../lib/motion";
 
@@ -10,12 +10,16 @@ interface Props {
   listening?: boolean;
   /** 0 to 1, read once per frame while listening. */
   level?: () => number;
+  /** Lana is working on her reply: a slow, quiet pulse around the disc instead of filler words. */
+  thinking?: boolean;
 }
 
 const LEVEL_SCALE = 0.35; // the halo grows by up to 35% at full voice
+const THINK_PULSE_S = 1.8; // one slow breath of the thinking ring
+const THINK_FADE_S = 0.2; // the ring fades in and out quickly
 
 /** The big mic. Its disc shares layoutId "lana-orb" with StatusOrb, so it morphs into the top bar. */
-export function MicButton({ busy, onStart, listening = false, level }: Props) {
+export function MicButton({ busy, onStart, listening = false, level, thinking = false }: Props) {
   const halo = useRef<HTMLSpanElement>(null);
   const reduceMotion = useReducedMotion();
 
@@ -43,8 +47,9 @@ export function MicButton({ busy, onStart, listening = false, level }: Props) {
     };
   }, [listening, level, reduceMotion]);
 
-  // While listening the rings hold still, so only the voice moves them.
-  const ring = { animation: listening ? "none" : undefined, animationPlayState: busy ? "paused" : "running" } as const;
+  // While listening the rings hold still, so only the voice moves them; while thinking the pulse below moves instead.
+  const still = listening || thinking;
+  const ring = { animation: still ? "none" : undefined, animationPlayState: busy ? "paused" : "running" } as const;
 
   return (
     <div className="relative grid size-[216px] place-items-center sm:size-[240px]">
@@ -71,7 +76,7 @@ export function MicButton({ busy, onStart, listening = false, level }: Props) {
         type="button"
         onClick={onStart}
         disabled={busy}
-        aria-label={listening ? "Lana is listening" : "Talk to Lana"}
+        aria-label={thinking ? "Lana is thinking" : listening ? "Lana is listening" : "Talk to Lana"}
         aria-busy={busy}
         className="pressable relative rounded-full disabled:cursor-progress"
       >
@@ -83,6 +88,26 @@ export function MicButton({ busy, onStart, listening = false, level }: Props) {
         >
           <Mic size={45} strokeWidth={1.5} aria-hidden />
         </motion.span>
+        <AnimatePresence>
+          {thinking && (
+            <motion.span
+              key="thinking"
+              aria-hidden
+              className="pointer-events-none absolute -inset-[10px] rounded-full border-2 border-primary/35"
+              initial={{ opacity: 0 }}
+              animate={
+                reduceMotion
+                  ? { opacity: 0.6, transition: { duration: THINK_FADE_S } }
+                  : {
+                      opacity: [0.3, 0.75, 0.3],
+                      scale: [0.98, 1.04, 0.98],
+                      transition: { duration: THINK_PULSE_S, repeat: Infinity, ease: "easeInOut" },
+                    }
+              }
+              exit={{ opacity: 0, transition: { duration: THINK_FADE_S } }}
+            />
+          )}
+        </AnimatePresence>
         {busy && (
           <motion.svg
             aria-hidden

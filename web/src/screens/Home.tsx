@@ -58,7 +58,13 @@ export function Home({ busy, onMic, onStart, listen, lana, onSay, micLevel, voic
 
         <div className="mt-3 sm:mt-4">
           {/* Once the session is open, tapping again does nothing: Lana is already listening. */}
-          <MicButton busy={busy} onStart={active ? () => {} : onMic} listening={listening} level={micLevel} />
+          <MicButton
+            busy={busy}
+            onStart={active ? () => {} : onMic}
+            listening={listening}
+            level={micLevel}
+            thinking={active && listen.thinking}
+          />
         </div>
 
         <motion.div {...leave} className="mt-4 flex w-full flex-col items-center gap-4">

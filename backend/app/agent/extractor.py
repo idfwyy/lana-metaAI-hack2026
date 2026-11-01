@@ -98,6 +98,7 @@ class _Extraction(BaseModel):
     )
     evening_hours: _Found[bool] | None = None
     needs_exam_first: _Found[bool] | None = None
+    note_answer: _Found[str] | None = Field(default=None, description="The clinic's answer to Lana's note question")
 
 
 def _normalize(text: str) -> tuple[str, list[int]]:
@@ -177,6 +178,7 @@ async def update_checklist(checklist: ClinicChecklist, transcript: Transcript) -
         timezone=settings.timezone,
         transcript=_format_transcript(transcript),
         current=_format_current(checklist),
+        note_question=f'"{checklist.note_question}"' if checklist.note_question else "(none asked on this call)",
     )
     found = await call_json(
         prompt, _Extraction, settings.model_fast, reasoning=settings.call_reasoning
@@ -185,7 +187,7 @@ async def update_checklist(checklist: ClinicChecklist, transcript: Transcript) -
     clinic_lines = [line for line in transcript.lines if line.speaker == Speaker.CLINIC]
     updates: dict[str, object] = {}
     for name, item in found:
-        if item is None:
+        if item is None or (name == "note_answer" and not checklist.note_question):
             continue
         for line in clinic_lines:
             quote = find_evidence(item.evidence, line.text)

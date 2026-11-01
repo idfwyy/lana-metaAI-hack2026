@@ -1,4 +1,4 @@
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { rise } from "../lib/motion";
 import type { Line } from "../lib/state";
 
@@ -16,6 +16,7 @@ interface Props {
 /** Live captions under the mic. Rows keep their height so nothing below jumps. */
 export function LiveCaptions({ lana, partial, heard, thinking, youLabel = "YOU" }: Props) {
   const you = partial || heard;
+  const reduceMotion = useReducedMotion();
 
   return (
     <div className="flex w-full max-w-[560px] flex-col gap-3 text-left" aria-live="polite">
@@ -26,12 +27,15 @@ export function LiveCaptions({ lana, partial, heard, thinking, youLabel = "YOU" 
             <motion.p
               key="thinking"
               initial={{ opacity: 0 }}
-              animate={{ opacity: [0.35, 1, 0.35] }}
+              animate={
+                reduceMotion
+                  ? { opacity: 0.8, transition: { duration: 0.2 } }
+                  : { opacity: [0.45, 0.9, 0.45], transition: { duration: 1.8, repeat: Infinity, ease: "easeInOut" } }
+              }
               exit={{ opacity: 0, transition: { duration: 0.1 } }}
-              transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
-              className="text-[16px] leading-[1.6] text-muted"
+              className="text-[15px] leading-[1.6] text-muted"
             >
-              Thinking
+              Lana is thinking
             </motion.p>
           ) : lana ? (
             <motion.p

@@ -4,7 +4,7 @@ import pytest
 
 from app import guard
 from app.agent import commands
-from app.agent.commands import Command, parse_command
+from app.agent.commands import Command, match_command, parse_command
 
 
 class FakeClassifier:
@@ -114,3 +114,22 @@ async def test_the_usage_limit_still_stops_the_case(classifier) -> None:
     classifier(error=guard.LimitHit("llm limit reached"))
     with pytest.raises(guard.LimitHit):
         await parse_command("let me see it")
+
+
+@pytest.mark.parametrize(
+    ("said", "command"),
+    [
+        ("Hold off.", Command.NOT_YET),
+        ("Hold off for now, Lana", Command.NOT_YET),
+        ("Not now", Command.NOT_YET),
+        ("Maybe later.", Command.NOT_YET),
+        ("Don't book it", Command.NOT_YET),
+        ("No thanks.", Command.NOT_YET),
+        ("Book it anyway", Command.YES_BOOK),
+        ("Go ahead.", Command.YES_BOOK),
+        ("Yes, book it", Command.YES_BOOK),
+    ],
+)
+def test_callback_answers_including_the_over_budget_question(said, command) -> None:
+    # "Want me to book it anyway, or hold off?" is answered without the classifier.
+    assert match_command(said) == command

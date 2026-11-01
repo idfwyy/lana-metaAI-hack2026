@@ -6,45 +6,54 @@ from app.agent import intake as intake_module
 from app.agent.intake import (
     CITIES,
     DEFAULT_BUDGET,
-    INTAKE_REASONING,
+    MAX_NOTES,
     MAX_QUESTIONS,
     NEAR_ME_DISTANCE_MI,
+    RETRY_PROMPT,
     Intake,
     city_zip,
-    fillers,
     match_city,
+    note_topic,
     parse_budget,
     reply_problem,
 )
 from app.config import get_settings
 from app.schemas.enums import Treatment
 
-TURN_KEYS = {"updates", "answered", "asking", "reply", "done", "medical_question"}
+TURN_KEYS = {"updates", "notes", "answered", "asking", "reply", "done", "medical_question"}
+RETRY_MARK = RETRY_PROMPT.split("{", 1)[0]
 
 
 class FakeJson:
     """Stands in for call_json: one scripted turn per call, validated by the schema.
 
     A dict without turn keys is just what the patient said (updates), with no reply from the
-    model, so Lana falls back to the fixed question.
+    model, so Lana falls back to the fixed question. A retry after a rejected line takes the
+    next of `retries` (none left: no reply again, so the fixed question).
     """
 
-    def __init__(self, replies: list[dict]) -> None:
+    def __init__(self, replies: list[dict], retries: list[dict] | None = None) -> None:
         self.replies = list(replies)
+        self.retries = list(retries or [])
         self.prompts: list[str] = []
         self.reasoning: list[str | None] = []
+        self.models: list[str] = []
 
     async def __call__(self, prompt, schema, model, images=None, reasoning=None):
         self.prompts.append(prompt)
         self.reasoning.append(reasoning)
-        reply = self.replies.pop(0) if self.replies else {}
+        self.models.append(model)
+        if RETRY_MARK in prompt:
+            reply = self.retries.pop(0) if self.retries else {}
+        else:
+            reply = self.replies.pop(0) if self.replies else {}
         return schema.model_validate(reply if set(reply) & TURN_KEYS else {"updates": reply})
 
 
 @pytest.fixture
 def fake_json(monkeypatch: pytest.MonkeyPatch):
-    def install(*replies: dict) -> FakeJson:
-        fake = FakeJson(list(replies))
+    def install(*replies: dict, retries: list[dict] | None = None) -> FakeJson:
+        fake = FakeJson(list(replies), retries)
         monkeypatch.setattr(intake_module, "call_json", fake)
         return fake
 
@@ -72,11 +81,14 @@ def test_first_line_uses_agent_name() -> None:
     )
 
 
-def test_fillers_rotate_from_the_prompt_file() -> None:
-    assert fillers() == ["Got it.", "Mm-hm.", "Okay.", "Sure."]
+def test_there_are_no_filler_lines() -> None:
+    assert "fillers" not in Intake()._lines
 
 
-async def test_the_model_reads_the_whole_conversation_at_low_reasoning(fake_json) -> None:
+async def test_the_model_reads_the_whole_conversation_with_the_intake_settings(fake_json, monkeypatch) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "intake_model", "intake-model")
+    monkeypatch.setattr(settings, "intake_reasoning", "medium")
     fake = fake_json(
         _turn("Braces, got it. Which city should I search near?", "location", ["treatment"], treatment="braces"),
         {},
@@ -86,7 +98,9 @@ async def test_the_model_reads_the_whole_conversation_at_low_reasoning(fake_json
     await intake.hear("I want braces")
     await intake.hear("hmm")
 
-    assert fake.reasoning == [INTAKE_REASONING, INTAKE_REASONING] and INTAKE_REASONING == "low"
+    # "hmm" got no usable line, so the model was asked once more with the reason.
+    assert set(fake.reasoning) == {"medium"} and set(fake.models) == {"intake-model"}
+    assert len(fake.prompts) == 3 and RETRY_MARK in fake.prompts[2]
     second = fake.prompts[1]
     assert "Heads-up, this is a demo" in second  # the greeting she actually said
     assert "Patient: I want braces" in second
@@ -318,7 +332,7 @@ async def test_finishes_after_all_fields(fake_json) -> None:
     assert [t.done for t in turns] == [False] * 5 + [True]
     last = turns[-1]
     assert last.next_question is None
-    assert last.spoken == "Got it. Braces near Dallas, under $5,000, evening hours. I'm calling clinics now. You can watch, or step away and I'll call you back."
+    assert last.spoken == "Got it. Braces near Dallas, under $5,000, evenings. I'm calling clinics now. You can watch, or step away and I'll call you back."
     assert "—" not in last.spoken
     prefs = intake.to_preferences()
     assert prefs.treatment == Treatment.BRACES
@@ -598,3 +612,228 @@ async def test_exact_city_needs_no_confirmation(fake_json) -> None:
 
     assert intake.draft.city == "Fort Worth" and intake.draft.zip_code == "76102"
     assert turn.spoken == _question(intake, "budget")
+
+
+# ---------- no praise openers ----------
+
+
+@pytest.mark.parametrize(
+    "reply, said",
+    [
+        ("Perfect, which city should I search near?", "Which city should I search near?"),
+        ("Perfect! Which city should I search near?", "Which city should I search near?"),
+        ("Great. Awesome, which city should I search near?", "Which city should I search near?"),
+        ("That's good. Which city should I search near?", "Which city should I search near?"),
+        ("Okay, wonderful, which city should I search near?", "Which city should I search near?"),
+        ("Braces, got it. Which city should I search near?", "Braces, got it. Which city should I search near?"),
+        ("Greatest hits aside, which city?", "Greatest hits aside, which city?"),
+    ],
+)
+def test_strip_praise(reply, said) -> None:
+    assert intake_module.strip_praise(reply) == said
+
+
+async def test_a_reply_opening_with_perfect_is_said_without_it(fake_json) -> None:
+    fake_json(_turn("Perfect, which city should I search near?", "location", ["treatment"], treatment="braces"))
+    intake = Intake()
+
+    turn = await intake.hear("braces please")
+
+    assert turn.spoken == "Which city should I search near?"
+
+
+# ---------- any city (demo honesty) ----------
+
+
+@pytest.mark.parametrize("place", ["San Francisco", "New York", "London", "Seattle", "Chicago"])
+def test_outside_places_match_no_dfw_city(place) -> None:
+    assert match_city(place) is None
+
+
+async def test_near_san_francisco_gets_the_demo_line_once(fake_json) -> None:
+    fake_json(
+        _turn("What's the most you'd want to spend?", "budget", ["treatment", "location"],
+              treatment="braces", city="San Francisco"),
+        _turn("Do you already have x-rays?", "records", ["budget", "pay"], budget="5k"),
+    )
+    intake = Intake()
+
+    first = await intake.hear("I need braces near San Francisco")
+    second = await intake.hear("about 5k, pay monthly")
+
+    demo = "This is a demo, so I'll use demo clinics placed near San Francisco. Real clinics come next."
+    assert first.spoken == f"{demo} What's the most you'd want to spend?"
+    assert demo not in second.spoken
+    prefs = intake.to_preferences()
+    assert prefs.place == "San Francisco"
+    assert prefs.zip_code == "76010"  # the demo clinics' area, used only inside the demo
+
+
+async def test_outside_place_said_with_everything_else_confirms_with_the_demo_line(fake_json) -> None:
+    fake_json({
+        "treatment": "braces", "city": "London", "budget": "5000", "prefers_monthly": True,
+        "has_xrays": False, "has_plan": False, "must_haves": [],
+    })
+    intake = Intake()
+
+    turn = await intake.hear("Braces in London under 5000, monthly, no x-rays, nothing else")
+
+    assert turn.done
+    assert turn.spoken.startswith("This is a demo, so I'll use demo clinics placed near London. Real clinics come next. Got it. Braces near London, under $5,000.")
+
+
+async def test_a_dfw_city_has_no_place(fake_json) -> None:
+    fake_json({"treatment": "braces", "city": "Dallas"})
+    intake = Intake()
+
+    turn = await intake.hear("braces near Dallas")
+
+    assert intake.to_preferences().place is None
+    assert "demo clinics placed near" not in turn.spoken
+
+
+# ---------- free-form understanding: time of day and notes ----------
+
+
+async def _at_must_haves(fake_json, *replies: dict, retries: list[dict] | None = None) -> tuple[Intake, FakeJson]:
+    """An intake that has just asked the must-haves question."""
+    fake = fake_json(ALL_BUT_MUST_HAVES, *replies, retries=retries)
+    intake = Intake()
+    first = await intake.hear("Braces near Dallas under 5k, monthly, no x-rays")
+    assert intake.current == "must_haves", first.spoken
+    return intake, fake
+
+
+async def test_no_i_just_want_mornings_sets_time_pref_and_answers_must_haves(fake_json) -> None:
+    intake, _ = await _at_must_haves(fake_json, _turn("", None, ["must_haves"], done=True, time_pref="morning"))
+
+    turn = await intake.hear("no, I just want mornings")
+
+    assert intake.draft.time_pref == "morning"
+    assert intake.is_answered("must_haves")
+    assert turn.done
+    assert "mornings" in turn.spoken
+    assert intake.to_preferences().time_pref == "morning"
+
+
+async def test_morning_hours_as_a_must_have_is_a_morning_time_pref(fake_json) -> None:
+    # What happened by voice: "morning hours" landed in must_haves, and an evening slot got booked.
+    intake, _ = await _at_must_haves(fake_json, {"must_haves": ["morning hours"]})
+
+    turn = await intake.hear("I want my appointment in morning hours")
+
+    prefs = intake.to_preferences()
+    assert prefs.time_pref == "morning"
+    assert turn.done
+    # Said once, as "mornings", not also as "morning hours".
+    assert turn.spoken.startswith("Got it. Braces near Dallas, under $5,000, mornings. I'm calling")
+
+
+async def test_notes_are_kept_cleaned_and_capped(fake_json) -> None:
+    fake_json(
+        {"updates": {"treatment": "braces"}, "notes": ["for her 15-year-old son.", "nervous about pain"]},
+        {"updates": {}, "notes": ["Nervous about pain", "wants Spanish-speaking staff", "doesn't drive — at all",
+                                  "prefers clear aligners if similar price", "a b c d e f g h i j k l"]},
+    )
+    intake = Intake()
+
+    first = await intake.hear("braces for my kid, he's 15, and honestly he's nervous about pain")
+    await intake.hear("somewhere close, I don't drive, and can they speak Spanish")
+
+    assert "notes" in first.filled
+    notes = intake.to_preferences().notes
+    assert notes == [
+        "for her 15-year-old son", "nervous about pain", "wants Spanish-speaking staff",
+        "doesn't drive, at all", "prefers clear aligners if similar price",
+    ]
+    assert len(notes) == MAX_NOTES
+    assert "Nervous about pain" not in notes  # a repeat, any case
+    assert all("—" not in n and len(n.split()) <= 10 for n in notes)
+
+
+async def test_a_failing_reply_is_regenerated_once_with_the_reason(fake_json) -> None:
+    bad = _turn("Great — which city? And your budget?", "location", ["treatment"], treatment="braces")
+    good = _turn("Which city should I search near?", "location")
+    fake = fake_json(bad, retries=[good])
+    intake = Intake()
+
+    turn = await intake.hear("braces")
+
+    assert turn.spoken == "Which city should I search near?"
+    assert len(fake.prompts) == 2
+    assert RETRY_MARK in fake.prompts[1] and "em dash" in fake.prompts[1]
+    assert intake.draft.treatment == Treatment.BRACES  # the first call's updates stand
+
+
+async def test_a_reply_that_fails_twice_uses_the_fixed_question(fake_json) -> None:
+    bad = _turn("Great — which city?", "location", ["treatment"], treatment="braces")
+    fake = fake_json(bad, retries=[_turn("Which city — or ZIP?", "location")])
+    intake = Intake()
+
+    turn = await intake.hear("braces")
+
+    assert turn.spoken == _question(intake, "location")
+    assert len(fake.prompts) == 2  # one retry only
+
+
+async def test_asking_about_an_answered_topic_is_regenerated(fake_json) -> None:
+    wrong = _turn("Braces or aligners?", "treatment", ["treatment"], treatment="braces")
+    fake = fake_json(wrong, retries=[_turn("Which city should I search near?", "location")])
+    intake = Intake()
+
+    turn = await intake.hear("braces")
+
+    assert turn.spoken == "Which city should I search near?"
+    assert '"treatment"' in fake.prompts[1]
+
+
+async def test_a_medical_question_is_not_regenerated(fake_json) -> None:
+    fake = fake_json(_turn("You'd need braces. Which city?", "location", medical_question=True))
+    intake = Intake()
+
+    turn = await intake.hear("do I really need braces?")
+
+    assert turn.spoken.startswith(intake._lines["no_advice"])
+    assert len(fake.prompts) == 1
+
+
+async def test_a_monthly_cap_means_monthly_and_is_noted(fake_json) -> None:
+    fake_json({"updates": {"monthly_max": "like two fifty"}, "answered": ["pay"]})
+    intake = Intake()
+
+    turn = await intake.hear("I can't do more than like two fifty a month")
+
+    assert intake.draft.prefers_monthly is True
+    assert intake.draft.budget_max is None  # a monthly amount is not a total budget
+    assert intake.draft.notes == ["up to $250 a month"]
+    assert {"prefers_monthly", "notes"} <= set(turn.filled)
+
+
+def test_two_fifty_is_250() -> None:
+    assert parse_budget("two fifty") == 250
+    assert parse_budget("five thousand five hundred") == 5500
+    assert parse_budget("twenty five hundred") == 2500
+
+
+def test_note_topics() -> None:
+    assert note_topic("wants Spanish-speaking staff") == "language"
+    assert note_topic("for her 15-year-old son") == "minor"
+    assert note_topic("nervous about pain") == "comfort"
+    assert note_topic("prefers clear aligners if similar price") == "aligners"
+    assert note_topic("doesn't drive") is None
+
+
+async def test_confirmation_mentions_the_time_and_one_askable_note(fake_json) -> None:
+    intake, _ = await _at_must_haves(
+        fake_json,
+        {"updates": {"time_pref": "weekend"}, "notes": ["doesn't drive", "wants Spanish-speaking staff", "nervous about pain"],
+         "answered": ["must_haves"], "done": True},
+    )
+
+    turn = await intake.hear("weekends only, I don't drive, and they should speak Spanish, I'm nervous too")
+
+    assert turn.done
+    assert turn.spoken == (
+        "Got it. Braces near Dallas, under $5,000, weekends. I noted: wants Spanish-speaking staff. "
+        "I'm calling clinics now. You can watch, or step away and I'll call you back."
+    )

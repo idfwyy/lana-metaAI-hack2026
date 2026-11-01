@@ -12,9 +12,13 @@ from app.agent.caller import (
     FALLBACK_QUESTIONS,
     HOLD_REQUEST,
     MAX_LANA_TURNS,
+    NOTE_QUESTIONS,
     OPENING_QUESTIONS,
+    TIME_SLOT_AGAIN,
+    TIME_SLOT_QUESTION,
     WORDS_PER_SECOND,
     Caller,
+    note_question,
     opening_lines,
 )
 from app.agent.extractor import CHECKLIST_ORDER
@@ -368,3 +372,82 @@ async def test_only_self_talk_uses_fallback(chat, no_extraction) -> None:
     await Caller(_clinic(), PREFS, on_line).run(FakeReceptionist())
 
     assert _lana(lines)[1] == FALLBACK_QUESTIONS["total_price"]
+
+
+# ---------- the patient's preferred time and notes ----------
+
+
+async def test_a_morning_patient_gets_the_time_specific_slot_question(chat, no_extraction, monkeypatch) -> None:
+    monkeypatch.setattr(get_settings(), "demo_checklist", "total_price,next_slots")
+    lines, on_line = _recorder()
+
+    await Caller(_clinic(), PREFS.model_copy(update={"time_pref": "morning"}), on_line).run(FakeReceptionist())
+
+    slot_lines = [t for t in _lana(lines) if "opening" in t]
+    # No slot after the first ask ("no mornings"): the second asks for the earliest at any time.
+    assert slot_lines == ["Do you have any morning openings next week?", TIME_SLOT_AGAIN]
+    assert "next_slots" not in chat.asked_fields()  # Python's line, never the model's
+
+
+async def test_any_time_keeps_the_model_slot_question(chat, no_extraction, monkeypatch) -> None:
+    monkeypatch.setattr(get_settings(), "demo_checklist", "total_price,next_slots")
+    lines, on_line = _recorder()
+
+    await Caller(_clinic(), PREFS, on_line).run(FakeReceptionist())
+
+    assert "next_slots" in chat.asked_fields()
+    assert not any("openings next week" in t for t in _lana(lines))
+
+
+async def test_one_note_question_at_most_per_call(chat, no_extraction) -> None:
+    prefs = PREFS.model_copy(update={"notes": ["nervous about pain", "wants Spanish-speaking staff", "doesn't drive"]})
+    lines, on_line = _recorder()
+
+    result = await Caller(_clinic(), prefs, on_line).run(FakeReceptionist())
+
+    asked = [t for t in _lana(lines) if t in NOTE_QUESTIONS.values() or "speak" in t or "nervous" in t]
+    assert asked == ["Does anyone at your office speak Spanish?"]  # language first, and only once
+    assert result.checklist.note_question == "Does anyone at your office speak Spanish?"
+    assert _lana(lines)[-1] == CLOSING_LINE
+    assert not any("note" == f for f in chat.asked_fields())
+
+
+async def test_no_askable_note_means_no_note_question(chat, no_extraction) -> None:
+    lines, on_line = _recorder()
+
+    result = await Caller(_clinic(), PREFS.model_copy(update={"notes": ["doesn't drive"]}), on_line).run(
+        FakeReceptionist()
+    )
+
+    assert result.checklist.note_question is None
+    assert not any(t in NOTE_QUESTIONS.values() for t in _lana(lines))
+
+
+def test_note_question_by_priority() -> None:
+    assert note_question(["prefers clear aligners", "for her 15-year-old son"]) == NOTE_QUESTIONS["minor"]
+    assert note_question(["nervous about pain"]) == NOTE_QUESTIONS["comfort"]
+    assert note_question(["prefers clear aligners if similar price"]) == NOTE_QUESTIONS["aligners"]
+    assert note_question(["wants staff who speak their language"]) == (
+        "Does anyone at your office speak a language other than English?"
+    )
+    assert note_question([]) is None
+
+
+async def test_the_patients_time_and_notes_are_in_the_prompt(chat, no_extraction) -> None:
+    prefs = PREFS.model_copy(update={"time_pref": "evening", "notes": ["nervous about pain"]})
+    await Caller(_clinic(), prefs, lambda *a: None).run(FakeReceptionist())
+
+    prompt = chat.calls[0][0]["content"]
+    assert "- Preferred appointment time: evening" in prompt
+    assert "- Notes from the patient: nervous about pain" in prompt
+    assert TIME_SLOT_QUESTION.format(time="evening") == "Do you have any evening openings next week?"
+
+
+async def test_a_must_have_a_clinic_can_answer_is_asked_as_the_note(chat, no_extraction) -> None:
+    lines, on_line = _recorder()
+
+    await Caller(_clinic(), PREFS.model_copy(update={"must_haves": ["spanish speaking"]}), on_line).run(
+        FakeReceptionist()
+    )
+
+    assert "Does anyone at your office speak Spanish?" in _lana(lines)

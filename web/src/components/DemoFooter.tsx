@@ -87,6 +87,10 @@ export function DemoFooter({ voice, setVoice, clinics, setClinics }: Props) {
           >
             <p className="mx-auto max-w-[1120px] pt-3 text-[14px] leading-[1.6] text-muted">
               <span className="block max-w-[64ch]">{DISCLAIMER}</span>
+              <span className="mt-2 block max-w-[64ch]">
+                Tip: use headphones. You can talk over Lana at any time to interrupt her, and with headphones
+                she never mistakes her own voice for yours.
+              </span>
             </p>
           </motion.div>
         )}

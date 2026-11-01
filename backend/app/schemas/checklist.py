@@ -30,5 +30,9 @@ class ClinicChecklist(BaseModel):
     next_slots: SourcedAnswer[list[AwareDatetime]] | None = None
     evening_hours: SourcedAnswer[bool] | None = None
     needs_exam_first: SourcedAnswer[bool] | None = None
+    # The one question Lana asked from the patient's notes ("Does anyone at your office speak
+    # Spanish?"), set by the caller, and the clinic's answer in short plain words.
+    note_question: str | None = None
+    note_answer: SourcedAnswer[str] | None = None
     # total_price already covers every fee ("$5,050 all together"), so no fee is added on top.
     total_is_all_in: bool = False
