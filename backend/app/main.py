@@ -5,15 +5,21 @@ each). A PatientSession turns them into transcripts, then into commands, intake 
 step away during the calls, or the yes / not yet of Lana's callback, and Lana speaks the
 reply. Half duplex: the browser mutes the mic while Lana talks, and the server sends Meta
 nothing during her lines (its session closes and reopens on the patient's next frame).
+
+Watch mode opens the same way, with a demo patient (data/demo_patients.json) in place of the
+mic: their request is voiced, Lana answers it with her real intake, and the calls start with
+the preferences she heard.
 """
 
 import asyncio
 import contextlib
 import logging
+import random
 import re
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -24,7 +30,8 @@ from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from app import guard
 from app.agent.commands import Command as SpokenCommand
 from app.agent.commands import parse_command
-from app.agent.intake import TOPIC_FIELDS, Intake
+from app.agent.caller import opening_lines
+from app.agent.intake import TOPIC_FIELDS, Intake, fillers
 from app.agent.orchestrator import Orchestrator, first_slot, spoken_slot
 from app.cli import DEMO_PREFERENCES
 from app.config import get_settings
@@ -59,7 +66,28 @@ BOOK_AGAIN = "Should I book it? You can say yes or not yet."
 BOOKED_LINE = "You're booked at {clinic} for {slot}. This is a demo clinic, so no real appointment was made."
 SAVED_LINE = "Saved, not booked. I'll hold this quote for you."
 NO_SLOT_LINE = "They didn't give me an opening time yet, so I saved the quote instead. I'll hold it for you."
-FIXED_LINES = [COMING_SOON, SORRY, BOOK_AGAIN, SAVED_LINE, NO_SLOT_LINE]
+# Watch mode: the demo patient's reply when Lana asks about something their scenario doesn't
+# cover, and her line if intake fails (the scenario's own preferences are used then).
+DEMO_DONE_LINE = "That's it, go ahead."
+DEMO_FALLBACK_CONFIRM = "Got it. I'm calling clinics now. You can watch, or step away and I'll call you back."
+FIXED_LINES = [COMING_SOON, SORRY, BOOK_AGAIN, SAVED_LINE, NO_SLOT_LINE, DEMO_FALLBACK_CONFIRM]
+# A filler plays if Lana's reply isn't ready this soon after the patient's turn ends.
+FILLER_AFTER_S = 0.4
+
+DEMO_PATIENTS_PATH = Path(__file__).resolve().parent / "data" / "demo_patients.json"
+
+
+class DemoPatient(BaseModel):
+    """One Watch mode scenario: what the patient asks, what they answer if Lana asks more."""
+
+    id: str
+    request: str
+    answers: dict[str, str] = Field(default_factory=dict, description="Keyed by intake topic")
+    preferences: Preferences = Field(description="Used if intake fails")
+
+
+def load_demo_patients() -> list[DemoPatient]:
+    return TypeAdapter(list[DemoPatient]).validate_json(DEMO_PATIENTS_PATH.read_bytes())
 
 # What the patient says to step away while the calls run (after _normalize).
 STEP_AWAY_PHRASES = {
@@ -99,27 +127,41 @@ async def _warm_up_voices() -> None:
     log.info("TTS warm-up took %.1fs: %s", time.perf_counter() - started, summary)
 
 
+def _demo_patient_lines() -> list[str]:
+    lines = [DEMO_DONE_LINE]
+    for patient in load_demo_patients():
+        lines += [patient.request, *patient.answers.values()]
+    return list(dict.fromkeys(lines))
+
+
 async def _prewarm_lines() -> None:
-    """Cache Lana's fixed patient lines in TTS, so they play at once and cost credits only once."""
+    """Cache the fixed lines in TTS, so they play at once and cost credits only once.
+
+    Lana's patient lines, fillers and call openings, then the demo patient's lines.
+    """
     if not get_settings().elevenlabs_api_key.get_secret_value():
         return
-    try:
-        voice_id = voice_for(Speaker.AGENT)
-    except VoiceConfigError as err:
-        log.warning("TTS prewarm skipped: %s", err)
-        return
     intake_lines = Intake()._lines
-    lines = [
-        _greeting(), *FIXED_LINES,
+    lana = [
+        _greeting(), *FIXED_LINES, *fillers(),
         *(intake_lines[topic] for topic in TOPIC_FIELDS),
+        *(intake_lines[f"again_{topic}"] for topic in TOPIC_FIELDS),
         *(intake_lines[f"default_{topic}"] for topic in TOPIC_FIELDS),
+        *opening_lines(),
     ]
-    try:
-        results = await tts.prewarm([(text, voice_id) for text in lines])
-    except Exception as err:  # ElevenLabs being down must never stop the server
-        log.warning("TTS prewarm failed: %s: %s", type(err).__name__, err)
-        return
-    log.info("TTS prewarm: %s", ", ".join(f"{r} {results.count(r)}" for r in sorted(set(results))))
+    for speaker, lines in ((Speaker.AGENT, lana), (Speaker.PATIENT, _demo_patient_lines())):
+        try:
+            voice_id = voice_for(speaker)
+        except VoiceConfigError as err:
+            log.warning("TTS prewarm skipped for %s: %s", speaker.value, err)
+            continue
+        try:
+            results = await tts.prewarm([(text, voice_id) for text in lines], speaker)
+        except Exception as err:  # ElevenLabs being down must never stop the server
+            log.warning("TTS prewarm failed: %s: %s", type(err).__name__, err)
+            return
+        summary = ", ".join(f"{r} {results.count(r)}" for r in sorted(set(results)))
+        log.info("TTS prewarm (%s): %s", speaker.value, summary)
 
 
 async def _cancel(task: asyncio.Task | None) -> None:
@@ -241,6 +283,36 @@ async def run_case(record: CaseRecord, bus: AudioBus, orchestrator: Orchestrator
              record.case.id, record.case.status.value, usage.llm_calls, usage.tts_chars)
 
 
+async def demo_intake(record: CaseRecord, bus: AudioBus) -> Preferences:
+    """Watch mode's opening: a demo patient asks, Lana answers with her real intake.
+
+    One patient line and Lana's reply; if she still needs something, the patient answers it
+    and Lana confirms with defaults for the rest. If intake fails, the scenario's own
+    preferences are used and Lana says a short confirmation.
+    """
+    case_id = record.case.id
+    patient = random.choice(load_demo_patients())
+    log.info("case=%s demo patient %s: %r", case_id, patient.id, patient.request)
+    intake = Intake()
+    await bus.patient_line(UserSaid(case_id=case_id, text=patient.request))
+    try:
+        turn = await intake.hear(patient.request)
+        await bus.emit(AgentSaid(case_id=case_id, text=turn.spoken))
+        if not turn.done:
+            answer = patient.answers.get(intake.current or "", DEMO_DONE_LINE)
+            await bus.patient_line(UserSaid(case_id=case_id, text=answer))
+            turn = await intake.hear(answer, finish=True)
+            await bus.emit(AgentSaid(case_id=case_id, text=turn.spoken))
+        return intake.to_preferences()
+    except guard.LimitHit:
+        raise
+    except Exception as err:
+        log.warning("case=%s demo intake failed, using %s's preferences: %s: %s",
+                    case_id, patient.id, type(err).__name__, err)
+        await bus.emit(AgentSaid(case_id=case_id, text=DEMO_FALLBACK_CONFIRM))
+        return patient.preferences
+
+
 # ---------- the patient's voice session ----------
 
 MP3_BYTES_PER_S = 128_000 // 8  # tts.OUTPUT_FORMAT is mp3_44100_128
@@ -314,7 +386,7 @@ class PatientSession:
         self._start_run = start_run
         self._step_away = step_away
         self.usage = guard.CaseUsage(record.case.id)
-        self.intake = Intake()
+        self.intake = Intake(greeting=_greeting())
         self.phase: Phase = phase
         self.listening = phase != "over"  # mic audio goes to Meta; off after a step away or a failure
         self.thinking = False  # a turn is being handled; Lana's reply comes next
@@ -325,6 +397,7 @@ class PatientSession:
         self._listener: asyncio.Task | None = None
         self._tasks: set[asyncio.Task] = set()
         self._turns = asyncio.Lock()
+        self._last_filler: str | None = None
 
     def _spawn(self, coro: Coroutine) -> asyncio.Task:
         with guard.case_usage(self.usage):
@@ -461,12 +534,23 @@ class PatientSession:
 
     # ----- turns -----
 
+    def _filler(self) -> str:
+        """A short filler, never the same one twice in a row."""
+        choices = [f for f in fillers() if f != self._last_filler] or fillers()
+        self._last_filler = random.choice(choices)
+        return self._last_filler
+
     async def _turn(self, text: str) -> None:
         text = text.strip()
         async with self._turns:
             self.thinking = True
+            work = asyncio.create_task(self._handle(text))
             try:
-                await self._handle(text)
+                # No dead air: if her reply isn't ready soon, Lana says "Mm-hm." while it comes.
+                done, _ = await asyncio.wait({work}, timeout=FILLER_AFTER_S)
+                if not done and self.phase == "intake":
+                    await self._say(self._filler())
+                await work
             except guard.LimitHit:
                 self.stop_listening()
                 await self.bus.send_payload(LIMIT_ERROR)
@@ -475,6 +559,7 @@ class PatientSession:
                 with contextlib.suppress(Exception):
                     await self._say(SORRY)
             finally:
+                await _cancel(work)
                 self.thinking = False
 
     async def _handle(self, text: str) -> None:
@@ -604,6 +689,7 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
 
     bus = AudioBus(record, send)
     run: asyncio.Task | None = None
+    intro: asyncio.Task | None = None  # Watch mode's demo patient and Lana, before the calls
     orchestrator: Orchestrator | None = None
     session: PatientSession | None = None
     voice = record.voice  # the case's setting; stepping away turns call audio off for a while
@@ -640,6 +726,20 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
     def new_session(phase: Phase = "intake") -> PatientSession:
         return PatientSession(record, bus, clock, start_run, step_away, phase=phase)
 
+    async def watch() -> None:
+        """The start message: the demo patient's request and Lana's reply, then the calls."""
+        usage = guard.CaseUsage(record.case.id)
+        try:
+            with guard.case_usage(usage):
+                preferences = await demo_intake(record, bus)
+        except guard.LimitHit:
+            await bus.send_payload(LIMIT_ERROR)
+            return
+        await start_run(preferences)
+
+    def busy() -> bool:
+        return (run is not None and not run.done()) or (intro is not None and not intro.done())
+
     try:
         while True:
             message = await websocket.receive()
@@ -659,9 +759,14 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
                 continue
 
             if isinstance(msg, Start):
-                await start_run(DEMO_PREFERENCES)
+                if busy():
+                    await bus.send_payload({"type": "error", "code": "running", "message": "The case is already running."})
+                elif not guard.allow_run(record.runs):
+                    await bus.send_payload(LIMIT_ERROR)
+                else:
+                    intro = asyncio.create_task(watch())
             elif isinstance(msg, Listen):
-                if session is not None or (run is not None and not run.done()):
+                if session is not None or busy():
                     await bus.send_payload({"type": "error", "code": "running", "message": "The case is already running."})
                 else:
                     session = new_session()
@@ -681,6 +786,7 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
             elif isinstance(msg, Stop):
                 if session is not None:
                     session.stop_listening()
+                await _cancel(intro)
                 await _cancel(run)
             else:
                 # Spoken commands arrive as text (user_text) and are parsed; later modes plug in here.
@@ -690,5 +796,6 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
     finally:
         if session is not None:
             await session.close()
+        await _cancel(intro)
         await _cancel(run)
         log.info("case=%s socket closed", case_id)

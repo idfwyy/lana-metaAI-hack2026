@@ -1,7 +1,10 @@
 """Intake: Lana's short chat that turns what the patient says into Preferences.
 
-The model only pulls out what the patient said. Python merges it into the draft, picks the
-next question from a fixed list in prompts/intake.md, and decides when intake is done.
+Each turn the model reads the whole conversation and the draft, and returns what the patient
+said, which topics they addressed, and Lana's next line. Python still owns the rules: it
+merges the values (budget, pay in full, cities, defaults), checks her line, falls back to a
+fixed question from prompts/intake.md when the line fails a check, and decides when intake
+is done.
 """
 
 import difflib
@@ -22,6 +25,8 @@ PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "intake.md"
 PROMPT_SPLIT = "<!-- lines -->"
 
 MAX_QUESTIONS = 6
+INTAKE_REASONING = "low"
+MAX_REPLY_SENTENCES = 2
 
 # The main DFW cities and a ZIP for each. A city without a ZIP gets its ZIP here; a place
 # that matches none of them gets DEFAULT_ZIP (Arlington).
@@ -66,7 +71,8 @@ DEFAULT_DISTANCE_MI = 15.0
 # A skipped budget means no cap in practice; every demo clinic lists well under this.
 DEFAULT_BUDGET = 10_000
 
-# The questions in the order Lana asks them, and the draft fields each one fills.
+# The topics in the order Lana asks them when she has no better idea, and the draft fields
+# each one fills. The first three matter most and are asked before the others.
 TOPIC_FIELDS: dict[str, tuple[str, ...]] = {
     "treatment": ("treatment",),
     "location": ("zip_code",),
@@ -75,11 +81,39 @@ TOPIC_FIELDS: dict[str, tuple[str, ...]] = {
     "records": ("has_xrays", "has_plan"),
     "must_haves": ("must_haves",),
 }
+IMPORTANT = ("treatment", "location", "budget")
+TOPIC_HINTS = {
+    "treatment": "braces, clear aligners, or not sure",
+    "location": "the city or ZIP to search near",
+    "budget": "the most they want to spend in total",
+    "pay": "monthly, in full if cheaper, or with an HSA or FSA",
+    "records": "whether they already have x-rays or a treatment plan",
+    "must_haves": "anything a clinic must have, like evening hours",
+}
+
+# "Near me" answers must-haves: a short distance, and "close by" for the ranker and the calls.
+NEAR_ME_DISTANCE_MI = 8.0
+NEAR_ME_MUST = "close by"
 
 _SKIP_RE = re.compile(
     r"\b(skip|pass|i don'?t know|idk|no idea|no clue|not sure|no preference|"
     r"doesn'?t matter|don'?t care|whatever)\b"
 )
+_NEAR_ME_RE = re.compile(r"\b(near me|close by|nearby|close to me|around here|near (my|our) (house|home|place))\b")
+# "No, nothing else" after the must-haves question.
+_NOTHING_RE = re.compile(
+    r"\b(no+|nope|nah|nothing|none|not really|that'?s (it|all|everything)|i'?m good|we'?re good|all good)\b"
+)
+# Lana's own line giving an opinion on treatment. Such a line is never said.
+_ADVICE_RE = re.compile(
+    r"\b(you|you'?ll|you'?d)\b[^.?!]{0,25}\b(need|should (get|go with|choose|pick)|don'?t need|won'?t need)\b"
+    r"[^.?!]{0,25}\b(braces|aligners|invisalign|treatment)\b"
+    r"|\bi'?d? (recommend|suggest)\b"
+    r"|\b(right|best|better) (choice |option |fit )?for you\b"
+    r"|\b(severe|mild|serious) case\b"
+    r"|\bsounds like you need\b"
+)
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 _MEDICAL_RE = re.compile(
     r"\b(do i (really |even |actually )?need|should i (get|do)|is (it|my \w+) (bad|severe|serious)|"
     r"how bad (is|are)|are my teeth)\b"
@@ -124,7 +158,7 @@ class PreferencesDraft(BaseModel):
 
 
 class _Heard(BaseModel):
-    """What the model returns for one patient reply. Python checks and merges it."""
+    """The preferences the model found in one patient reply. Python checks and merges them."""
 
     treatment: Treatment | None = None
     zip_code: str | None = None
@@ -138,7 +172,16 @@ class _Heard(BaseModel):
     has_plan: bool | None = None
     must_haves: list[str] | None = None
     free_times: list[str] | None = None
-    skip: bool = False
+
+
+class _Turn(BaseModel):
+    """What the model returns for one turn: what was said, and Lana's next line."""
+
+    updates: _Heard = Field(default_factory=_Heard)
+    answered: list[str] = Field(default_factory=list, description="Topics the patient addressed")
+    asking: str | None = Field(default=None, description="The missing topic the reply asks about")
+    reply: str = ""
+    done: bool = False
     medical_question: bool = False
 
 
@@ -153,6 +196,38 @@ def _prompts() -> tuple[str, dict[str, str]]:
     prompt, lines = PROMPT_PATH.read_text(encoding="utf-8").split(PROMPT_SPLIT, 1)
     fixed = dict(re.findall(r"^- (\w+): (.+)$", lines, flags=re.MULTILINE))
     return prompt.strip(), fixed
+
+
+def fillers() -> list[str]:
+    """Lana's short fillers ("Got it.", "Mm-hm."), said while the model works on her reply."""
+    return [f.strip() for f in _prompts()[1]["fillers"].split("|") if f.strip()]
+
+
+def _norm(line: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", line.lower()).strip()
+
+
+def reply_problem(reply: str, previous: str | None) -> str | None:
+    """Why Lana can't say this model line, or None. The fixed question is said instead."""
+    if not reply.strip():
+        return "empty"
+    if "—" in reply or "–" in reply:
+        return "em dash"
+    if _ADVICE_RE.search(reply.lower().replace("’", "'")):
+        return "medical opinion"
+    if len([s for s in _SENTENCE_RE.split(reply.strip()) if s.strip()]) > MAX_REPLY_SENTENCES:
+        return "more than two sentences"
+    if reply.count("?") != 1 or not reply.rstrip().endswith("?"):
+        return "not one question"
+    if previous is not None and _norm(reply) == _norm(previous):
+        return "same as her previous line"
+    return None
+
+
+def _question_part(reply: str) -> str:
+    """The question sentence of a checked reply, for when Python leads with its own line."""
+    sentences = [s for s in _SENTENCE_RE.split(reply.strip()) if s.strip()]
+    return next((s for s in reversed(sentences) if s.endswith("?")), reply.strip())
 
 
 def _words_to_int(text: str) -> int | None:
@@ -262,27 +337,33 @@ def _says_pay_in_full(text: str) -> bool:
 
 
 class Intake:
-    def __init__(self) -> None:
+    def __init__(self, greeting: str | None = None) -> None:
         self.draft = PreferencesDraft()
         self.asked = 0
         self.current: str | None = None  # the topic Lana asked last; None before the first question
-        self.skipped: set[str] = set()
+        self.answered: set[str] = set()  # topics addressed without a value: "skip", "nothing", defaults
         # Replies that left a topic unanswered. The second one sets its default: never a third ask.
         self.misses: dict[str, int] = dict.fromkeys(TOPIC_FIELDS, 0)
         self.done = False
         self._fuzzy_city: str | None = None  # a city fuzzy-matched from this reply, for Lana to confirm
         self._prompt, self._lines = _prompts()
+        # The whole chat as (speaker, text), starting with the greeting Lana actually said.
+        self.history: list[tuple[str, str]] = [("lana", greeting or self.first_line())]
 
     def first_line(self) -> str:
         return self._lines["greeting"].format(agent_name=get_settings().agent_name)
 
     def is_answered(self, topic: str) -> bool:
-        return topic in self.skipped or any(
+        return topic in self.answered or any(
             getattr(self.draft, name) is not None for name in TOPIC_FIELDS[topic]
         )
 
-    def _next_topic(self) -> str | None:
-        return next((t for t in TOPIC_FIELDS if not self.is_answered(t)), None)
+    def missing(self) -> list[str]:
+        """Unanswered topics, the important ones first."""
+        return [t for t in TOPIC_FIELDS if not self.is_answered(t)]
+
+    def _previous(self) -> str | None:
+        return next((text for speaker, text in reversed(self.history) if speaker == "lana"), None)
 
     def _format_draft(self) -> str:
         said = self.draft.model_dump(exclude_none=True, mode="json")
@@ -290,60 +371,128 @@ class Intake:
             return "Nothing yet."
         return "\n".join(f"- {name}: {value}" for name, value in said.items())
 
-    async def hear(self, text: str) -> IntakeTurn:
-        """Take one patient reply, merge what it says, and decide what Lana says next."""
+    def _format_history(self) -> str:
+        name = get_settings().agent_name
+        return "\n".join(f"{name if who == 'lana' else 'Patient'}: {text}" for who, text in self.history)
+
+    def _fixed(self, topic: str, previous: str | None) -> str:
+        """The fixed question for a topic, or its rephrase if that was Lana's previous line."""
+        line = self._lines[topic]
+        if previous is not None and _norm(line) == _norm(previous):
+            line = self._lines[f"again_{topic}"]
+        return line
+
+    async def hear(self, text: str, finish: bool = False) -> IntakeTurn:
+        """Take one patient reply, merge what it says, and decide what Lana says next.
+
+        finish=True ends intake on this turn: anything still missing takes its default.
+        """
         if self.done:
             raise RuntimeError("intake is already done")
         text = text.strip()
         lowered = text.lower().replace("’", "'")
         settings = get_settings()
-        question = (
-            self._lines[self.current] if self.current else self.first_line()
-        )
+        previous = self._previous()
+        asked = self.current
+        self.history.append(("patient", text))
+        missing = self.missing()
         prompt = self._prompt.format(
             agent_name=settings.agent_name,
-            question=question,
+            conversation=self._format_history(),
             draft=self._format_draft(),
-            text=text,
+            answered=", ".join(t for t in TOPIC_FIELDS if t not in missing) or "None yet.",
+            missing="\n".join(f"- {t}: {TOPIC_HINTS[t]}" for t in missing) or "Nothing.",
+            previous=previous or "None.",
+            turns_left=max(0, MAX_QUESTIONS - self.asked),
         )
-        heard = await call_json(prompt, _Heard, settings.model_fast, reasoning=settings.call_reasoning)
+        turn = await call_json(prompt, _Turn, settings.model_fast, reasoning=INTAKE_REASONING)
 
-        medical = heard.medical_question or bool(_MEDICAL_RE.search(lowered))
+        medical = turn.medical_question or bool(_MEDICAL_RE.search(lowered))
         self._fuzzy_city = None
-        filled = self._merge(heard, lowered, medical)
+        filled = self._merge(turn.updates, lowered, medical)
+        filled = list(dict.fromkeys(filled + self._mark_answered(turn, lowered, asked, medical)))
 
-        current = self.current
         default = ""
-        if current is not None and not self.is_answered(current):
-            if not medical and (heard.skip or _SKIP_RE.search(lowered)):
-                self.skipped.add(current)
-            else:
-                self.misses[current] += 1
-                if self.misses[current] >= 2:
-                    # Asked twice with no usable answer: use the default, say so, move on.
-                    self.skipped.add(current)
-                    default = self._lines[f"default_{current}"] + " "
-                    log.info("intake used the default for %s after two unusable answers", current)
+        if asked is not None and not self.is_answered(asked) and not medical:
+            self.misses[asked] += 1
+            if self.misses[asked] >= 2:
+                # Asked twice with no usable answer: use the default, say so, move on.
+                self.answered.add(asked)
+                default = self._lines[f"default_{asked}"] + " "
+                log.info("intake used the default for %s after two unusable answers", asked)
 
-        topic = self._next_topic()
+        missing = self.missing()
+        important = [t for t in IMPORTANT if t in missing]
+        allowed = important or missing
+        lead = self._lines["no_advice"] + " " if medical else ""
         # A question repeated after the no-advice line is the same question, not a new one.
-        repeat = medical and topic is not None and topic == current
-        if topic is not None and not repeat:
-            if self.asked >= MAX_QUESTIONS:
-                topic = None
-            else:
-                self.asked += 1
+        repeat = medical and asked in missing
+        out_of_turns = self.asked >= MAX_QUESTIONS and not repeat
+        model_done = turn.done and not important and not medical
+        if not missing or finish or model_done or out_of_turns:
+            self.done = True
+            self.current = None
+            self.answered.update(missing)  # the rest takes its defaults
+            spoken = lead + default + self._confirmation()
+            self.history.append(("lana", spoken))
+            # The confirmation names the place, so a fuzzy city needs no separate check.
+            return IntakeTurn(filled=filled, done=True, spoken=spoken)
+
+        reply = turn.reply.strip().strip('"').strip()
+        problem = None if turn.asking in allowed else f"asks about {turn.asking!r}, allowed {allowed}"
+        problem = problem or reply_problem(reply, previous)
+        from_model = False
+        if repeat:
+            topic, question = asked, self._fixed(asked, None)
+        elif problem is None and not medical:
+            topic, question, from_model = turn.asking, reply, True
+        else:
+            if not medical:
+                log.info("intake fell back to the fixed question (%s): %r", problem, reply)
+            topic = allowed[0]
+            question = self._fixed(topic, previous)
+        if not repeat:
+            self.asked += 1
         self.current = topic
 
-        lead = self._lines["no_advice"] + " " if medical else ""
-        if topic is None:
-            self.done = True
-            # The confirmation names the place, so a fuzzy city needs no separate check.
-            return IntakeTurn(filled=filled, done=True, spoken=lead + default + self._confirmation())
         if self._fuzzy_city:
             lead += self._lines["fuzzy_city"].format(city=self._fuzzy_city) + " "
-        next_question = self._lines[topic]
-        return IntakeTurn(filled=filled, next_question=next_question, spoken=lead + default + next_question)
+        if (lead or default) and from_model:
+            question = _question_part(reply)  # Python's own line is the acknowledgement
+        spoken = lead + default + question
+        if previous is not None and _norm(spoken) == _norm(previous):
+            question = self._lines[f"again_{topic}"]
+            spoken = lead + default + question
+        self.history.append(("lana", spoken))
+        return IntakeTurn(filled=filled, next_question=question, spoken=spoken)
+
+    def _mark_answered(self, turn: _Turn, text: str, asked: str | None, medical: bool) -> list[str]:
+        """Topics the patient addressed without a value: the model's list, "near me", "nothing", "skip"."""
+        filled: list[str] = []
+        for topic in turn.answered:
+            # "Do I need braces?" addresses no topic.
+            if topic in TOPIC_FIELDS and not (medical and topic == "treatment"):
+                self.answered.add(topic)
+
+        if _NEAR_ME_RE.search(text):
+            if turn.updates.max_distance_mi is None:
+                self.draft.max_distance_mi = NEAR_ME_DISTANCE_MI
+                filled.append("max_distance_mi")
+            musts = self.draft.must_haves or []
+            if NEAR_ME_MUST not in musts:
+                self.draft.must_haves = [*musts, NEAR_ME_MUST]
+                filled.append("must_haves")
+            self.answered.add("must_haves")
+        elif (asked == "must_haves" or "must_haves" in turn.answered) and not turn.updates.must_haves:
+            if _NOTHING_RE.search(text) or "must_haves" in turn.answered:
+                if self.draft.must_haves is None:
+                    self.draft.must_haves = []
+                    filled.append("must_haves")
+                self.answered.add("must_haves")
+
+        if asked is not None and not medical and not self.is_answered(asked) and _SKIP_RE.search(text):
+            self.answered.add(asked)
+        return filled
 
     def _merge(self, heard: _Heard, text: str, medical: bool) -> list[str]:
         """Write what the patient said into the draft. A later answer replaces an earlier one."""

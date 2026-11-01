@@ -104,6 +104,8 @@ export interface AgentSaid extends Base {
 export interface UserSaid extends Base {
   type: "user_said";
   text: string;
+  /** Watch mode's demo patient: spoken aloud, so it plays as a line with its own audio. */
+  voiced?: boolean;
 }
 export interface LogLine extends Base {
   type: "log_line";
@@ -236,12 +238,13 @@ export type ServerEvent =
 
 export type ServerMessage = ServerEvent | AudioFrame;
 
-export type LineEvent = AgentSaid | TranscriptFinal;
+export type LineEvent = AgentSaid | TranscriptFinal | UserSaid;
 
 export function isLine(m: ServerMessage): m is LineEvent {
   return (
     m.type === "agent_said" ||
-    (m.type === "transcript_final" && (m.speaker === "agent" || m.speaker === "clinic"))
+    (m.type === "transcript_final" && (m.speaker === "agent" || m.speaker === "clinic")) ||
+    (m.type === "user_said" && m.voiced === true)
   );
 }
 

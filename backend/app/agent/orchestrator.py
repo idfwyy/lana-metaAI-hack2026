@@ -329,7 +329,7 @@ class Orchestrator:
             self.case.held_call_id = held.call_id
             await self.advance(S.HOLDING)
             await held.status(CallStatus.ON_HOLD)
-            await self._log(f"{_short(first.name)} is holding while I check the others")
+            await self._log(self._hold_line(first, others))
         else:
             await held.status(CallStatus.ENDED)
 
@@ -337,6 +337,7 @@ class Orchestrator:
             await self.advance(S.CALLING)
             call = await self._checklist_call(clinic, end_with="close")
             await call.status(CallStatus.ENDED)
+            await self._log(self._compare_line(clinic, first))
 
         if others:
             negotiation = await self._resume(held)
@@ -357,6 +358,30 @@ class Orchestrator:
 
     def _quote(self, clinic_id: str) -> Quote:
         return next(q for q in self.case.quotes if q.clinic_id == clinic_id)
+
+    def _price(self, clinic_id: str) -> int | None:
+        quote = next((q for q in self.case.quotes if q.clinic_id == clinic_id), None)
+        return quote.all_in_price if quote is not None else None
+
+    def _hold_line(self, first: Clinic, others: list[Clinic]) -> str:
+        """'Parkway is $5,050 all in. That's the best fit so far, so I'm asking them to hold while I check Sunrise'."""
+        name, price = _short(first.name), self._price(first.id)
+        check = " and ".join(_short(c.name) for c in others)
+        said = f"{name} is ${price:,} all in. That's" if price is not None else f"{name} didn't confirm a full price, but they're"
+        return f"{said} the best fit so far, so I'm asking them to hold while I check {check}"
+
+    def _compare_line(self, clinic: Clinic, held: Clinic) -> str:
+        """'Sunrise is $4,200 all in, $850 less than Parkway'."""
+        name, price, other = _short(clinic.name), self._price(clinic.id), self._price(held.id)
+        if price is None:
+            return f"{name} didn't confirm a full price"
+        line = f"{name} is ${price:,} all in"
+        if other is None:
+            return line
+        if price == other:
+            return f"{line}, the same as {_short(held.name)}"
+        gap = abs(other - price)
+        return f"{line}, ${gap:,} {'less' if price < other else 'more'} than {_short(held.name)}"
 
     def _new_call(self, clinic: Clinic) -> _Call:
         return _Call(self, clinic, self._sheets[clinic.id])
@@ -394,7 +419,6 @@ class Orchestrator:
         await self.advance(S.NEGOTIATING)
         self.case.held_call_id = None
         await held.status(CallStatus.LIVE)
-        await self._log(f"Back to {_short(held.clinic.name)}")
 
         target_id = pick_target(self.case.quotes, self.case.clinics, self.case.preferences)
         if target_id == held.clinic.id:
@@ -403,9 +427,10 @@ class Orchestrator:
         if target_id is None:
             await held.say(NO_DEAL_LINE)
             await held.status(CallStatus.ENDED)
-            await self._log(f"{_short(held.clinic.name)} is already the best deal, no need to negotiate")
+            await self._log(f"{_short(held.clinic.name)} is already the best deal, so I'm wrapping up with them")
             return None
 
+        await self._log(f"Wrapping up with {_short(held.clinic.name)}")
         await held.say(RESUME_CLOSE_LINE)
         await held.status(CallStatus.ENDED)
         call = self._new_call(self._clinic(target_id))
@@ -418,10 +443,11 @@ class Orchestrator:
         quote = self._quote(call.clinic.id)
         moves = plan_moves(quote, self.case.quotes, self.case.clinics, self.case.preferences)
         match = next((m for m in moves if m.kind == MoveKind.MATCH), None)
+        lead = f"Going back to {name}" if resumed else f"Calling {name} back"
         if match is not None:
-            await self._log(f"Asking {name} to match {_short(match.cited_clinic)}'s ${match.cited_amount:,}")
+            await self._log(f"{lead} to ask them to match {_short(match.cited_clinic)}'s ${match.cited_amount:,}")
         else:
-            await self._log(f"Negotiating with {name}")
+            await self._log(f"{lead} to ask for a better price")
 
         async def on_concession(concession: Concession, new_all_in: int) -> None:
             # The price drops on screen the moment the clinic agrees, while the call goes on.
@@ -447,7 +473,10 @@ class Orchestrator:
             on_concession=on_concession,
         )
         await call.status(CallStatus.ENDED)
-        await self._log(f"Saved ${result.total_saved:,} with {name}")
+        if result.total_saved > 0:
+            await self._log(f"{name} came down to ${result.final_all_in:,}, ${result.total_saved:,} off")
+        else:
+            await self._log(f"{name} wouldn't move from ${result.final_all_in:,}")
         return result
 
     async def _finish(self, negotiation: NegotiationResult | None) -> None:

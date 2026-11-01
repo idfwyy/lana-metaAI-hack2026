@@ -63,7 +63,13 @@ export function Home({ busy, onMic, onStart, listen, lana, onSay, micLevel, voic
 
         <motion.div {...leave} className="mt-4 flex w-full flex-col items-center gap-4">
           {active && (
-            <LiveCaptions lana={lana} partial={listen.partial} heard={listen.heard} thinking={listen.thinking} />
+            <LiveCaptions
+              lana={lana}
+              partial={listen.partial}
+              heard={listen.heard}
+              thinking={listen.thinking}
+              youLabel={listen.demo ? "PATIENT" : "YOU"}
+            />
           )}
 
           <AnimatePresence initial={false}>
@@ -79,7 +85,10 @@ export function Home({ busy, onMic, onStart, listen, lana, onSay, micLevel, voic
             )}
           </AnimatePresence>
 
-          <FlashCard phrases={phrasesFor(listen)} onPick={active && listen.fallback ? onSay : undefined} />
+          {/* Watch mode: the demo patient does the talking, so there is nothing to say or tap. */}
+          {!listen.demo && (
+            <FlashCard phrases={phrasesFor(listen)} onPick={active && listen.fallback ? onSay : undefined} />
+          )}
 
           {active && listen.fallback && <TypeBox onSay={onSay} />}
 

@@ -219,3 +219,53 @@ async def test_live_three_words(cache_dir):
     voice_id = voice_for(Speaker.AGENT)
     audio = await _collect("Hello from Lana.", voice_id)
     assert len(audio) > 1000
+
+
+def test_demo_patient_voice_falls_back_to_clinic_1(voices, monkeypatch):
+    monkeypatch.setattr(voices, "voice_patient", "")
+    assert voice_for(Speaker.PATIENT) == "clinic-1-voice"
+    monkeypatch.setattr(voices, "voice_patient", "patient-voice")
+    assert voice_for(Speaker.PATIENT) == "patient-voice"
+    assert tts.model_for(Speaker.PATIENT) == "clinic-model"
+
+
+class BreaksOffOnce:
+    """The first request sends one chunk and then fails; later ones send the whole line."""
+
+    def __init__(self, fail_every_time: bool = False) -> None:
+        self.calls = 0
+        self.fail_every_time = fail_every_time
+
+    async def stream(self, voice_id, **kwargs):
+        self.calls += 1
+        yield b"ab"
+        if self.calls == 1 or self.fail_every_time:
+            raise ConnectionError("stream reset")
+        yield b"cd"
+
+
+def _client_with(monkeypatch, tts_api) -> None:
+    class FakeClient:
+        text_to_speech = tts_api
+
+    monkeypatch.setattr(tts, "_client", lambda: FakeClient())
+
+
+async def test_a_line_that_breaks_off_is_requested_again_and_sent_whole(voices, cache_dir, monkeypatch):
+    api = BreaksOffOnce()
+    _client_with(monkeypatch, api)
+
+    chunks = [c async for c in stream_speech("Hi there", "lana-voice", speaker=Speaker.AGENT)]
+
+    assert chunks == [b"ab", b"cd"]  # never the cut-off "ab" on its own
+    assert api.calls == 2
+    assert _path("Hi there", "lana-voice").read_bytes() == b"abcd"
+
+
+async def test_a_line_that_breaks_off_twice_yields_nothing(voices, cache_dir, monkeypatch):
+    api = BreaksOffOnce(fail_every_time=True)
+    _client_with(monkeypatch, api)
+
+    assert await _collect("Hi there", "lana-voice") == b""
+    assert api.calls == 2
+    assert not _path("Hi there", "lana-voice").exists()

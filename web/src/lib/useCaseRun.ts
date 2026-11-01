@@ -1,5 +1,6 @@
 // One case on one socket: socket in, player in the middle, reducers out.
-// A Watch case opens with start. A patient case opens with listen: Lana greets, the mic
+// A Watch case opens with start: a demo patient asks Lana for help on Home (voiced, no mic),
+// she answers, and the calls start. A patient case opens with listen: Lana greets, the mic
 // streams to the server, and the listen state below drives Home through intake. When intake
 // is done the calls start and the mic stays open for "I'll wait". At the end Lana calls back:
 // answer() picks up, and the listen state drives the callback's captions.
@@ -32,6 +33,8 @@ export interface ListenState {
   preferences: Preferences | null;
   /** Lana's callback was answered: she waits on "book it" or "not yet". */
   callback: boolean;
+  /** Watch mode: the one talking to Lana on Home is the demo patient, not the viewer. */
+  demo: boolean;
 }
 
 export const initialListen: ListenState = {
@@ -47,10 +50,12 @@ export const initialListen: ListenState = {
   draft: {},
   preferences: null,
   callback: false,
+  demo: false,
 };
 
 type ListenAction =
   | { kind: "listen" }
+  | { kind: "demo" }
   | { kind: "callback" }
   | { kind: "mic"; mic: ListenState["mic"]; fallback?: boolean }
   | { kind: "speaking"; on: boolean }
@@ -63,6 +68,8 @@ function listenReducer(state: ListenState, action: ListenAction): ListenState {
       return initialListen;
     case "listen":
       return { ...initialListen, active: true, mic: "starting" };
+    case "demo":
+      return { ...initialListen, active: true, demo: true };
     case "callback":
       return { ...state, active: true, callback: true, partial: "", heard: null, thinking: false };
     case "mic":
@@ -76,6 +83,8 @@ function listenReducer(state: ListenState, action: ListenAction): ListenState {
     case "user_partial":
       return { ...state, partial: e.text, heard: null };
     case "user_said":
+      // The demo patient's line plays as it shows, so Lana isn't "thinking" over their voice.
+      if (e.voiced) return { ...state, partial: "", heard: e.text, thinking: false };
       // During the calls nothing waits on her; in intake and the callback her reply comes next.
       return { ...state, partial: "", heard: e.text, thinking: !state.done || state.callback };
     case "agent_said":
@@ -193,7 +202,14 @@ export function useCaseRun(onStartOver?: () => void): {
     [stop, stopMic, goAway],
   );
 
-  const start = useCallback((caseId: string) => void open(caseId, { type: "start" }), [open]);
+  const start = useCallback(
+    (caseId: string) => {
+      open(caseId, { type: "start" });
+      // Home stays up while the demo patient and Lana talk; the calls move it on.
+      listenDispatch({ kind: "demo" });
+    },
+    [open],
+  );
 
   const listenTo = useCallback(
     (caseId: string, micPromise: Promise<Mic>) => {

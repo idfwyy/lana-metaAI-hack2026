@@ -12,8 +12,9 @@ from fastapi.testclient import TestClient
 from app import guard, main
 from app.agent import commands as commands_module
 from app.agent import intake as intake_module
-from app.agent.intake import Intake
+from app.agent.intake import TOPIC_FIELDS, Intake, fillers
 from app.agent.ranker import rank_offers
+from app.agent.researcher import pick_clinics
 from app.cli import DEMO_PREFERENCES
 from app.config import get_settings
 from app.data.loader import get_public_clinics
@@ -33,6 +34,8 @@ QUOTES = Path(__file__).parent / "fixtures" / "transcripts" / "three_quotes.json
 SUMMARY = "Parkway Orthodontics came in at $5,050 all in."
 
 LOUD = (8000).to_bytes(2, "little", signed=True) * (AUDIO_FORMAT.chunk_bytes(CHUNK_MS) // 2)
+
+REAL_DEMO_INTAKE = main.demo_intake  # the world fixture swaps it out for most tests
 
 
 def _script(case_id: str) -> list:
@@ -68,6 +71,7 @@ class World:
         self.charged: list[float] = []  # STT seconds charged to the case
         self.preferences: list = []  # each run's preferences
         self.outcome: list[str] = []  # "booked" / "saved"
+        self.intake_delay = 0.0  # seconds intake's call_json takes
 
 
 class FakeSTT:
@@ -164,7 +168,15 @@ def world(monkeypatch) -> World:
         return None
 
     async def fake_intake_json(prompt, schema, model, images=None, reasoning=None):
-        return schema.model_validate(w.heard.pop(0) if w.heard else {})
+        if w.intake_delay:
+            await asyncio.sleep(w.intake_delay)
+        reply = w.heard.pop(0) if w.heard else {}
+        # A flat dict is just what the patient said; Lana's reply then falls back to the fixed question.
+        known = {"updates", "answered", "asking", "reply", "done", "medical_question"}
+        return schema.model_validate(reply if set(reply) & known else {"updates": reply})
+
+    async def no_demo_intake(record, bus):
+        return DEMO_PREFERENCES
 
     async def fake_classifier(prompt, schema, model, images=None, reasoning=None):
         w.classified.append(prompt)
@@ -182,9 +194,12 @@ def world(monkeypatch) -> World:
         "voice_clinic_1": "clinic-1-voice",
         "voice_clinic_2": "clinic-2-voice",
         "voice_clinic_3": "clinic-3-voice",
+        "voice_patient": "patient-voice",
     }.items():
         monkeypatch.setattr(settings, name, value)
     monkeypatch.setattr(main, "Orchestrator", FakeOrchestrator)
+    # Watch runs start straight from DEMO_PREFERENCES; the demo patient has its own tests below.
+    monkeypatch.setattr(main, "demo_intake", no_demo_intake)
     monkeypatch.setattr(main, "_warm_up_voices", no_warm_up)
     monkeypatch.setattr(main, "_open_clients", lambda: None)
     monkeypatch.setattr(main, "_prewarm_lines", no_warm_up)
@@ -779,3 +794,125 @@ def test_step_away_phrases() -> None:
     assert main.is_step_away("Okay Lana, call me back")
     assert not main.is_step_away("The total is $4,800.")
     assert not main.is_step_away("I'll wait for the manager to check")
+
+
+# ---------- no dead air ----------
+
+
+def test_a_slow_reply_gets_a_filler_first(client, world) -> None:
+    world.intake_delay = 0.6
+    world.heard = [{"treatment": "aligners"}]
+    with _listen(client) as ws:
+        _greeted(ws)
+        ws.send_json({"type": "user_text", "text": "Clear aligners"})
+        messages = _until(ws, lambda m: m["type"] == "agent_said" and m["text"] == _question("location"))
+    kinds = [m["type"] for m in messages if m["type"] != "audio"]
+    assert kinds == ["user_said", "agent_said", "intake", "agent_said"]
+    filler = next(m for m in messages if m["type"] == "agent_said")
+    assert filler["text"] in fillers()
+    assert (filler["text"], "lana-voice", Speaker.AGENT) in world.spoken
+
+
+def test_a_fast_reply_has_no_filler(client, world) -> None:
+    world.heard = [{"treatment": "aligners"}]
+    with _listen(client) as ws:
+        _greeted(ws)
+        ws.send_json({"type": "user_text", "text": "Clear aligners"})
+        messages = _until(ws, lambda m: m["type"] == "agent_said")
+    assert messages[-1]["text"] == _question("location")
+    assert not any(m["type"] == "agent_said" and m["text"] in fillers() for m in messages)
+
+
+def test_fillers_never_repeat_twice_in_a_row() -> None:
+    session = type("S", (), {"_last_filler": None})()
+    picked = [main.PatientSession._filler(session) for _ in range(40)]
+    assert set(picked) == set(fillers())
+    assert all(a != b for a, b in zip(picked, picked[1:]))
+
+
+# ---------- Watch mode's demo patient ----------
+
+
+def test_demo_patients_load_and_each_can_lead_to_a_hold() -> None:
+    patients = main.load_demo_patients()
+    assert len(patients) == 4 and len({p.id for p in patients}) == 4
+    for patient in patients:
+        assert set(patient.answers) <= set(TOPIC_FIELDS), patient.id
+        # A hold needs a second clinic in range, at the default two clinics.
+        assert len(pick_clinics(patient.preferences, 2)) == 2, patient.id
+        for line in [patient.request, *patient.answers.values()]:
+            assert "—" not in line
+    assert {p.preferences.zip_code for p in patients} == {"76010", "75201", "76102", "75039"}
+    assert set(main._demo_patient_lines()) >= {p.request for p in patients}
+
+
+def _one_patient(monkeypatch, index: int = 0):
+    patient = main.load_demo_patients()[index]
+    monkeypatch.setattr(main, "demo_intake", REAL_DEMO_INTAKE)
+    monkeypatch.setattr(main, "load_demo_patients", lambda: [patient])
+    return patient
+
+
+def test_watch_opens_with_the_demo_patient_and_lanas_real_intake(client, world, monkeypatch) -> None:
+    patient = _one_patient(monkeypatch)
+    reply = "Braces near Arlington in the evenings, got it. How would you like to pay?"
+    world.heard = [
+        {
+            "updates": {"treatment": "braces", "city": "Arlington", "budget": "five thousand",
+                        "must_haves": ["evening hours"]},
+            "answered": ["treatment", "location", "budget", "must_haves"],
+            "asking": "pay",
+            "reply": reply,
+        },
+        {"updates": {"prefers_monthly": True}, "answered": ["pay"]},
+    ]
+
+    messages = _run(client)
+
+    talk = [m for m in messages if m["type"] in ("user_said", "agent_said")]
+    assert [(m["type"], m.get("voiced")) for m in talk] == [
+        ("user_said", True), ("agent_said", None), ("user_said", True), ("agent_said", None),
+    ]
+    assert talk[0]["text"] == patient.request
+    assert talk[1]["text"] == reply
+    assert talk[2]["text"] == patient.answers["pay"]
+    assert talk[3]["text"].startswith("Got it. Braces near Arlington, under $5,000, evening hours.")
+    # The patient is voiced in the patient voice, and the calls start only after Lana's line.
+    assert [f["speaker"] for f in _audio(messages, talk[0]["seq"])] == ["patient"] * 3
+    assert world.spoken[0] == (patient.request, "patient-voice", Speaker.PATIENT)
+    first_status = next(i for i, m in enumerate(messages) if m["type"] == "case_status")
+    assert messages.index(talk[3]) < first_status
+    prefs = world.preferences[-1]
+    assert prefs.zip_code == "76010" and prefs.budget_max == 5000
+    assert prefs.prefers_monthly is True and prefs.must_haves == ["evening hours"]
+    assert not any(m["type"] == "intake" for m in messages)  # agent ws-watch validates every event
+
+
+def test_watch_uses_the_scenario_if_intake_fails(client, world, monkeypatch) -> None:
+    patient = _one_patient(monkeypatch, 2)
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("Meta is down")
+
+    monkeypatch.setattr(intake_module, "call_json", broken)
+
+    messages = _run(client)
+
+    said = [m["text"] for m in messages if m["type"] == "agent_said"]
+    assert said == [main.DEMO_FALLBACK_CONFIRM]
+    assert world.preferences[-1] == patient.preferences
+    assert world.runs == 1
+
+
+def test_stop_during_the_demo_intake_cancels_it(client, world, monkeypatch) -> None:
+    _one_patient(monkeypatch)
+    world.intake_delay = 30  # Lana is still thinking
+    case_id = _new_case(client)
+    with client.websocket_connect(f"/ws/case/{case_id}") as ws:
+        ws.send_json({"type": "start"})
+        _until(ws, lambda m: m["type"] == "audio" and m["last"])  # the patient's request
+        ws.send_json({"type": "start"})
+        assert ws.receive_json()["code"] == "running"
+        ws.send_json({"type": "stop"})
+        time.sleep(0.2)
+    assert world.runs == 0

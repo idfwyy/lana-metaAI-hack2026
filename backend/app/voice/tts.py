@@ -44,10 +44,13 @@ class VoiceConfigError(ValueError):
 
 
 def voice_for(speaker: Speaker, clinic: Clinic | None = None) -> str:
-    """The ElevenLabs voice ID for a speaker: VOICE_AGENT for Lana, the clinic's VOICE_CLINIC_n for a clinic."""
+    """The ElevenLabs voice ID for a speaker: VOICE_AGENT for Lana, the clinic's VOICE_CLINIC_n for a
+    clinic, and VOICE_PATIENT (or VOICE_CLINIC_1 when blank) for Watch mode's demo patient."""
     settings = get_settings()
     if speaker == Speaker.AGENT:
         setting = "VOICE_AGENT"
+    elif speaker == Speaker.PATIENT:
+        setting = "VOICE_PATIENT" if settings.voice_patient else "VOICE_CLINIC_1"
     elif speaker == Speaker.CLINIC:
         if clinic is None:
             raise VoiceConfigError("A clinic voice needs the clinic, to read its voice_id")
@@ -155,9 +158,11 @@ async def stream_speech(
     perform them; for other models they are stripped first. Lana's lines get ELEVENLABS_TAG_AGENT
     in front when her model performs tags. Show strip_audio_tags(text) on screen either way.
 
-    On any failure or a stall longer than TIMEOUT_SECONDS it logs and stops. If that
-    happens before the first chunk the caller gets no audio and shows the text only.
-    Only a fully received line is written to the cache.
+    A cache miss is received whole before the first chunk is yielded: the browser decodes a
+    line only once it has all of it, so nothing is lost, and a line that breaks off midway
+    (an error, or a stall longer than TIMEOUT_SECONDS) is never played cut short. Such a line
+    is requested once more; if that fails too it logs and yields nothing, and the caller shows
+    the text only. Only a fully received line is written to the cache.
 
     The one exception it raises: guard.LimitHit, when a case run is over its TTS character limit.
     """
@@ -173,13 +178,37 @@ async def stream_speech(
                 yield chunk
         return
 
-    guard.charge_tts(len(text))  # only cache misses cost credits
+    guard.charge_tts(len(text))  # only cache misses cost credits, and a retry is not charged again
     log.info(
         "tts cache miss: sending %d chars to ElevenLabs (%s, voice %s, stability %s)",
         len(text), model, voice_id, vs.stability,
     )
+    parts = None
+    for attempt in range(1, TTS_ATTEMPTS + 1):
+        parts = await _generate(text, voice_id, model, vs, attempt)
+        if parts is not None:
+            break
+    if parts is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".part")
+        tmp.write_bytes(b"".join(parts))
+        tmp.replace(path)
+    except OSError as err:
+        log.warning("tts cache write failed: %s", err)
+    for part in parts:
+        yield part
+
+
+TTS_ATTEMPTS = 2  # a line that breaks off is requested once more
+
+
+async def _generate(text: str, voice_id: str, model: str, vs: VoiceSettings, attempt: int) -> list[bytes] | None:
+    """Every mp3 chunk of one line from ElevenLabs, or None if it failed or broke off. Never raises."""
     started = time.perf_counter()
     parts: list[bytes] = []
+    first_chunk_s = 0.0
     stream = None
     try:
         stream = _client().text_to_speech.stream(
@@ -199,11 +228,13 @@ async def stream_speech(
                 if not parts:
                     first_chunk_s = time.perf_counter() - started
                 parts.append(chunk)
-                yield chunk
     except Exception as err:  # never raise into the call loop
         kind = "timed out" if isinstance(err, TimeoutError) else f"failed: {type(err).__name__}: {err}"
-        log.warning("tts %s after %.1fs (%d chars, voice %s)", kind, time.perf_counter() - started, len(text), voice_id)
-        return
+        log.warning(
+            "tts %s after %.1fs, attempt %d, %d bytes received (%d chars, voice %s)",
+            kind, time.perf_counter() - started, attempt, sum(map(len, parts)), len(text), voice_id,
+        )
+        return None
     finally:
         if stream is not None:
             try:
@@ -212,19 +243,13 @@ async def stream_speech(
                 pass
 
     if not parts:
-        log.warning("tts returned no audio (%d chars, voice %s)", len(text), voice_id)
-        return
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".part")
-        tmp.write_bytes(b"".join(parts))
-        tmp.replace(path)
-    except OSError as err:
-        log.warning("tts cache write failed: %s", err)
+        log.warning("tts returned no audio, attempt %d (%d chars, voice %s)", attempt, len(text), voice_id)
+        return None
     log.info(
-        "tts done in %.1fs (first chunk %.2fs): %d chars, %d bytes",
-        time.perf_counter() - started, first_chunk_s, len(text), sum(map(len, parts)),
+        "tts done in %.1fs (first chunk %.2fs, attempt %d): %d chars, %d bytes",
+        time.perf_counter() - started, first_chunk_s, attempt, len(text), sum(map(len, parts)),
     )
+    return parts
 
 
 WARM_UP_TEXT = "Hi."

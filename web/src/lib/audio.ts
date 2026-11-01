@@ -31,6 +31,8 @@ export function unlockAudio(): void {
 
 export interface PlayingLine {
   duration: number;
+  /** Size of the mp3 that was decoded, for the dev log. */
+  bytes: number;
   /** Seconds played so far, clamped to the duration. */
   elapsed: () => number;
   ended: Promise<void>;
@@ -70,7 +72,9 @@ export async function playLine(chunks: string[]): Promise<PlayingLine> {
   if (c.state !== "running") throw new Error("Audio is locked");
   if (chunks.length === 0) throw new Error("No audio");
 
-  const buffer = await decode(c, decodeBase64(chunks));
+  const data = decodeBase64(chunks);
+  const bytes = data.byteLength; // decoding detaches the buffer
+  const buffer = await decode(c, data);
   const src = c.createBufferSource();
   src.buffer = buffer;
   src.connect(c.destination);
@@ -89,6 +93,7 @@ export async function playLine(chunks: string[]): Promise<PlayingLine> {
 
   return {
     duration: buffer.duration,
+    bytes,
     elapsed: () => (done ? buffer.duration : Math.min(buffer.duration, c.currentTime - startedAt)),
     ended,
     stop: () => {

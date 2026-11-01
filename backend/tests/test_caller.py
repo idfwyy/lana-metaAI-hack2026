@@ -12,8 +12,10 @@ from app.agent.caller import (
     FALLBACK_QUESTIONS,
     HOLD_REQUEST,
     MAX_LANA_TURNS,
+    OPENING_QUESTIONS,
     WORDS_PER_SECOND,
     Caller,
+    opening_lines,
 )
 from app.agent.extractor import CHECKLIST_ORDER
 from app.clinics.simulator import is_hold_request
@@ -113,7 +115,6 @@ def _lana(lines) -> list[str]:
 
 
 async def test_first_line_is_exact_disclosure_then_question(chat, no_extraction) -> None:
-    chat.replies = ["How much is comprehensive braces treatment at your office?"]
     lines, on_line = _recorder()
 
     await Caller(_clinic(), PREFS, on_line).run(FakeReceptionist())
@@ -123,11 +124,27 @@ async def test_first_line_is_exact_disclosure_then_question(chat, no_extraction)
         f"Hi there! This is {get_settings().agent_name}, I'm an AI assistant calling for a patient. "
         "Just so you know, this call's recorded."
     )
-    assert lines[0] == (
-        Speaker.AGENT,
-        f"{disclosure} How much is comprehensive braces treatment at your office?",
-        0.0,
-    )
+    openings = [f"{disclosure} {q.format(treatment='braces')}" for q in OPENING_QUESTIONS]
+    assert lines[0][0] == Speaker.AGENT and lines[0][2] == 0.0
+    assert lines[0][1] in openings
+    assert lines[0][1] in opening_lines()  # so the TTS prewarm covers it
+
+
+async def test_opening_varies_between_calls(chat, no_extraction) -> None:
+    firsts = []
+    for _ in range(6):
+        lines, on_line = _recorder()
+        await Caller(_clinic(), PREFS, on_line).run(FakeReceptionist())
+        firsts.append(lines[0][1])
+    assert all(a != b for a, b in zip(firsts, firsts[1:]))  # never the same wording twice in a row
+
+
+async def test_aligners_opening_names_clear_aligners(chat, no_extraction) -> None:
+    lines, on_line = _recorder()
+
+    await Caller(_clinic(), PREFS.model_copy(update={"treatment": Treatment.ALIGNERS}), on_line).run(FakeReceptionist())
+
+    assert "clear aligners" in lines[0][1]
 
 
 @pytest.fixture
@@ -152,7 +169,7 @@ async def test_each_field_asked_at_most_twice_in_order(chat, no_extraction, full
     await Caller(_clinic(), PREFS, lambda *a: None).run(FakeReceptionist())
 
     expected = [f for f in CHECKLIST_ORDER for _ in range(2)][: MAX_LANA_TURNS - 1]
-    assert chat.asked_fields() == expected
+    assert chat.asked_fields() == expected[1:]  # the opening price question is Python's
 
 
 async def test_demo_checklist_limits_the_questions(chat, no_extraction) -> None:
@@ -160,14 +177,14 @@ async def test_demo_checklist_limits_the_questions(chat, no_extraction) -> None:
     await Caller(_clinic(), PREFS, lambda *a: None).run(FakeReceptionist())
 
     expected = ["total_price", "records_fee", "monthly_payment", "next_slots"]
-    assert chat.asked_fields() == [f for f in expected for _ in range(2)]
+    assert chat.asked_fields() == [f for f in expected for _ in range(2)][1:]
 
 
 async def test_custom_demo_checklist_is_respected(chat, no_extraction, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(get_settings(), "demo_checklist", "next_slots,total_price")
     await Caller(_clinic(), PREFS, lambda *a: None).run(FakeReceptionist())
 
-    assert chat.asked_fields() == ["total_price", "total_price", "next_slots", "next_slots"]
+    assert chat.asked_fields() == ["total_price", "next_slots", "next_slots"]
 
 
 async def test_ends_when_all_fields_filled(chat, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -186,7 +203,6 @@ async def test_ends_when_all_fields_filled(chat, monkeypatch: pytest.MonkeyPatch
 
 async def test_lines_never_name_another_clinic(chat, no_extraction) -> None:
     chat.replies = [
-        "How much is the full treatment?",
         "Parkway Orthodontics quoted less, could you match it?",
         "Is that cheaper than lakeside?",
     ]
@@ -213,7 +229,7 @@ async def test_failed_model_turn_uses_fallback(monkeypatch: pytest.MonkeyPatch, 
 
     await Caller(_clinic(), PREFS, on_line).run(FakeReceptionist())
 
-    assert lines[0][1].endswith(FALLBACK_QUESTIONS["total_price"])
+    assert _lana(lines)[1] == FALLBACK_QUESTIONS["total_price"]
 
 
 async def test_times_are_running_start_seconds(chat, no_extraction) -> None:
@@ -252,10 +268,16 @@ async def test_budget_and_patient_info_in_prompt(chat, no_extraction) -> None:
 async def test_history_roles(chat, no_extraction) -> None:
     await Caller(_clinic(), PREFS, lambda *a: None).run(FakeReceptionist("We're open."))
 
+    first = chat.calls[0]  # Lana's second line; the opening was Python's
+    assert [m["role"] for m in first] == ["system", "assistant", "user"]
+    assert first[2]["content"] == "We're open."
+
+
+async def test_model_opening_sends_the_prompt_as_a_user_message(chat, no_extraction, monkeypatch) -> None:
+    monkeypatch.setattr(get_settings(), "demo_checklist", "next_slots")  # not a price question first
+    await Caller(_clinic(), PREFS, lambda *a: None).run(FakeReceptionist())
+
     assert [m["role"] for m in chat.calls[0]] == ["user"]  # the API needs a user message
-    second = chat.calls[1]
-    assert [m["role"] for m in second] == ["system", "assistant", "user"]
-    assert second[2]["content"] == "We're open."
 
 
 async def test_em_dashes_and_labels_are_cleaned(chat, no_extraction) -> None:
@@ -264,7 +286,7 @@ async def test_em_dashes_and_labels_are_cleaned(chat, no_extraction) -> None:
 
     await Caller(_clinic(), PREFS, on_line).run(FakeReceptionist())
 
-    assert lines[0][1].endswith("Great, is there a records fee?")
+    assert _lana(lines)[1] == "Great, is there a records fee?"
 
 
 async def test_end_with_hold_asks_to_hold_and_keeps_reply(chat, no_extraction) -> None:
@@ -334,9 +356,9 @@ async def test_leaked_planning_note_is_not_said(chat, no_extraction) -> None:
     await Caller(_clinic(), PREFS, on_line).run(FakeReceptionist())
 
     lana = _lana(lines)
-    assert lana[0].endswith(" Thanks for that, and when are your next openings?")
-    assert "I'll ask" not in lana[0]
-    assert lana[1] == CLEAN
+    assert lana[1] == "Thanks for that, and when are your next openings?"
+    assert "I'll ask" not in lana[1]
+    assert lana[2] == CLEAN
 
 
 async def test_only_self_talk_uses_fallback(chat, no_extraction) -> None:
@@ -345,4 +367,4 @@ async def test_only_self_talk_uses_fallback(chat, no_extraction) -> None:
 
     await Caller(_clinic(), PREFS, on_line).run(FakeReceptionist())
 
-    assert lines[0][1].endswith(FALLBACK_QUESTIONS["total_price"])
+    assert _lana(lines)[1] == FALLBACK_QUESTIONS["total_price"]

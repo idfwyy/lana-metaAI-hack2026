@@ -9,15 +9,17 @@ interface Props {
   partial: string;
   heard: string | null;
   thinking: boolean;
+  /** Who the second row is: "YOU", or "PATIENT" for Watch mode's demo patient. */
+  youLabel?: string;
 }
 
 /** Live captions under the mic. Rows keep their height so nothing below jumps. */
-export function LiveCaptions({ lana, partial, heard, thinking }: Props) {
+export function LiveCaptions({ lana, partial, heard, thinking, youLabel = "YOU" }: Props) {
   const you = partial || heard;
 
   return (
     <div className="flex w-full max-w-[560px] flex-col gap-3 text-left" aria-live="polite">
-      <div className="grid min-h-[52px] grid-cols-[48px_minmax(0,1fr)] gap-3">
+      <div className="grid min-h-[52px] grid-cols-[64px_minmax(0,1fr)] gap-3">
         <span className="speaker-label pt-[6px] text-primary">LANA</span>
         <AnimatePresence mode="wait" initial={false}>
           {thinking ? (
@@ -50,9 +52,9 @@ export function LiveCaptions({ lana, partial, heard, thinking }: Props) {
         </AnimatePresence>
       </div>
 
-      <div className="grid min-h-[28px] grid-cols-[48px_minmax(0,1fr)] gap-3">
+      <div className="grid min-h-[28px] grid-cols-[64px_minmax(0,1fr)] gap-3">
         <span className="speaker-label pt-[6px] text-muted" style={{ opacity: you ? 1 : 0.45 }}>
-          YOU
+          {youLabel}
         </span>
         {/* Partials update in place: they change several times a second, so no motion. */}
         <p className={`text-[16px] leading-[1.6] ${partial ? "text-muted" : "text-ink"}`}>{you}</p>

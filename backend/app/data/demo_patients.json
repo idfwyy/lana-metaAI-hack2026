@@ -1,0 +1,69 @@
+[
+  {
+    "id": "arlington_evenings",
+    "request": "Hi Lana! I need braces near Arlington, under five thousand dollars, and I can only do evenings after work.",
+    "answers": {
+      "pay": "Monthly payments would be best.",
+      "records": "No x-rays yet.",
+      "must_haves": "No, nothing else. Just evenings."
+    },
+    "preferences": {
+      "treatment": "braces",
+      "zip_code": "76010",
+      "max_distance_mi": 15,
+      "budget_max": 5000,
+      "prefers_monthly": true,
+      "must_haves": ["evening hours"]
+    }
+  },
+  {
+    "id": "dallas_pay_in_full",
+    "request": "Hey, I'm looking for braces in Dallas. I want to stay under forty five hundred, and I can pay in full if that's cheaper.",
+    "answers": {
+      "records": "No, I don't have x-rays.",
+      "must_haves": "No, that's it.",
+      "pay": "I can pay it all at once if it saves me money."
+    },
+    "preferences": {
+      "treatment": "braces",
+      "zip_code": "75201",
+      "max_distance_mi": 15,
+      "budget_max": 4500,
+      "pay_in_full_ok": true
+    }
+  },
+  {
+    "id": "fort_worth_hsa",
+    "request": "Hi! I'd like braces near Fort Worth, somewhere close by. I'd pay monthly with my HSA.",
+    "answers": {
+      "budget": "Around five thousand, give or take.",
+      "records": "I don't have x-rays yet.",
+      "must_haves": "No, nothing else."
+    },
+    "preferences": {
+      "treatment": "braces",
+      "zip_code": "76102",
+      "max_distance_mi": 8,
+      "budget_max": 5000,
+      "prefers_monthly": true,
+      "uses_hsa_fsa": true,
+      "must_haves": ["close by"]
+    }
+  },
+  {
+    "id": "irving_not_sure",
+    "request": "Hi Lana. I'm not sure, maybe braces? I'm in Irving, and I'd like to keep it under six thousand.",
+    "answers": {
+      "pay": "Monthly, probably.",
+      "records": "No x-rays.",
+      "must_haves": "Nope, that's all."
+    },
+    "preferences": {
+      "treatment": "not sure",
+      "zip_code": "75039",
+      "max_distance_mi": 15,
+      "budget_max": 6000,
+      "prefers_monthly": true
+    }
+  }
+]

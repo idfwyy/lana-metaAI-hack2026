@@ -31,6 +31,7 @@ from app.schemas.events import (
     CaseStatusEvent,
     ConcessionWon,
     ErrorEvent,
+    LogLine,
     OffersReady,
     TranscriptFinal,
 )
@@ -215,9 +216,21 @@ def test_researcher_orders_by_fit_then_rating_and_logs() -> None:
 
     assert [c.id for c in picked] == ["parkway", "sunrise", "lakeside"]
     assert logs == [
-        "Found 3 orthodontists within 15 miles",
-        "Calling Parkway first: best fit for evening hours",
+        "Found 3 orthodontists within 15 miles of Arlington",
+        "Calling Parkway first, they fit best (evening hours, 4.9 stars)",
         "Then Sunrise, then Lakeside",
+    ]
+
+
+def test_researcher_reason_without_must_haves_is_rating_and_unknown_zip_is_shown() -> None:
+    logs: list[str] = []
+
+    pick_clinics(_prefs(must_haves=[], zip_code="75999"), max_clinics=2, on_log=logs.append)
+
+    assert logs == [
+        "Found 3 orthodontists within 15 miles of 75999",
+        "Calling Parkway first, they're the highest rated (4.9 stars, 3.1 mi away)",
+        "Then Sunrise",
     ]
 
 
@@ -226,7 +239,7 @@ def test_researcher_filters_distance_and_truncates() -> None:
     assert [c.id for c in pick_clinics(_prefs(), max_clinics=2)] == ["parkway", "sunrise"]
     logs: list[str] = []
     assert pick_clinics(_prefs(max_distance_mi=1), on_log=logs.append) == []
-    assert logs == ["No orthodontists found within 1 mile"]
+    assert logs == ["No orthodontists found within 1 mile of Arlington"]
 
 
 # ---------- states ----------
@@ -521,3 +534,22 @@ async def test_not_yet_saves(world: World) -> None:
 
     assert orch.case.status == S.SAVED
     assert _statuses(events)[-1] == S.SAVED
+
+
+async def test_log_reads_like_lana_thinking(world: World) -> None:
+    _win_on_parkway(world)
+
+    _, events = await _run()
+
+    logs = [e.text for e in events if isinstance(e, LogLine)]
+    assert logs == [
+        "Found 3 orthodontists within 15 miles of Arlington",
+        "Calling Parkway first, they fit best (evening hours, 4.9 stars)",
+        "Then Sunrise, then Lakeside",
+        "Parkway is $5,050 all in. That's the best fit so far, so I'm asking them to hold while I check Sunrise and Lakeside",
+        "Sunrise is $4,200 all in, $850 less than Parkway",
+        "Lakeside is $4,650 all in, $400 less than Parkway",
+        "Going back to Parkway to ask them to match Sunrise's $4,200",
+        "Parkway came down to $3,990, $1,060 off",
+    ]
+    assert len(set(logs)) == len(logs)  # nothing repeated per clinic

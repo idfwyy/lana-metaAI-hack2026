@@ -4,6 +4,9 @@ For each Lana or clinic line: the text event first (audio tags stripped), then t
 mp3 as audio frames that point back to it with line_seq. Lines are voiced one at a time;
 emit() returns only after the line's last frame is sent. If voice is off or TTS fails, a
 single failed marker follows the text so the browser never waits for audio that won't come.
+
+Watch mode's demo patient speaks too: patient_line() sends a user_said marked voiced, then
+its audio in the patient voice. The real patient's own words (UserSaid via emit) are never voiced.
 """
 
 import asyncio
@@ -18,7 +21,7 @@ from app.data.loader import get_public_clinics
 from app.db.store import CaseRecord
 from app.schemas.clinic import Clinic
 from app.schemas.enums import Speaker
-from app.schemas.events import AgentSaid, CallStatusEvent, TranscriptFinal
+from app.schemas.events import AgentSaid, CallStatusEvent, TranscriptFinal, UserSaid
 from app.voice.tts import VoiceConfigError, stream_speech, strip_audio_tags, voice_for
 
 log = logging.getLogger(__name__)
@@ -58,22 +61,34 @@ class AudioBus:
             else:
                 await self._send(event.model_dump(mode="json"))
 
-    def _voice(self, event: AgentSaid | TranscriptFinal) -> tuple[Speaker, str | None]:
-        speaker = Speaker.AGENT if isinstance(event, AgentSaid) else event.speaker
+    async def patient_line(self, event: UserSaid) -> None:
+        """The demo patient says a line out loud: shown like the patient's own words, voiced."""
+        if guard.limit_hit():
+            return
+        async with self._lock:
+            await self._line(event)
+
+    def _voice(self, event: AgentSaid | TranscriptFinal | UserSaid) -> tuple[Speaker, str | None]:
+        if isinstance(event, UserSaid):
+            speaker = Speaker.PATIENT
+        else:
+            speaker = Speaker.AGENT if isinstance(event, AgentSaid) else event.speaker
         if not self.record.voice:
             return speaker, None
         try:
-            if speaker == Speaker.AGENT:
+            if speaker in (Speaker.AGENT, Speaker.PATIENT):
                 return speaker, voice_for(speaker)
-            clinic = self._clinics.get(self._call_clinic.get(event.call_id or "", ""))
+            clinic = self._clinics.get(self._call_clinic.get(getattr(event, "call_id", None) or "", ""))
             return speaker, voice_for(speaker, clinic)
         except VoiceConfigError as err:
             log.warning("case=%s no voice for a %s line: %s", self.record.case.id, speaker, err)
             return speaker, None
 
-    async def _line(self, event: AgentSaid | TranscriptFinal) -> None:
-        shown = event.model_copy(update={"text": strip_audio_tags(event.text)})
-        line_seq = await self._send(shown.model_dump(mode="json"))
+    async def _line(self, event: AgentSaid | TranscriptFinal | UserSaid) -> None:
+        shown = event.model_copy(update={"text": strip_audio_tags(event.text)}).model_dump(mode="json")
+        if isinstance(event, UserSaid):
+            shown["voiced"] = True  # the browser plays it as a line
+        line_seq = await self._send(shown)
         speaker, voice_id = self._voice(event)
         audio = {"type": "audio", "line_seq": line_seq, "speaker": speaker.value}
 

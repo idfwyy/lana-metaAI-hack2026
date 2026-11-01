@@ -80,6 +80,8 @@ class Settings(BaseSettings):
     voice_clinic_1: str = ""
     voice_clinic_2: str = ""
     voice_clinic_3: str = ""
+    # The demo patient in Watch mode. Blank falls back to VOICE_CLINIC_1.
+    voice_patient: str = ""
 
     # App
     database_url: str = "sqlite:///./data/dev.db"

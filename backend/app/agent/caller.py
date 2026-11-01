@@ -2,11 +2,13 @@
 
 Python decides what Lana asks next (the first missing field) and when the call ends.
 The model only phrases the question and answers the receptionist from the patient's
-Preferences.
+Preferences. The opening price question is Python's: one of a few wordings, never the one
+the last call used, so each call sounds a little different and starts without a model call.
 """
 
 import inspect
 import logging
+import random
 import re
 import uuid
 from collections.abc import Awaitable, Callable
@@ -20,7 +22,7 @@ from app.data.loader import get_public_clinics
 from app.integrations.meta_llm import stream_chat
 from app.schemas.checklist import ClinicChecklist
 from app.schemas.clinic import Clinic
-from app.schemas.enums import Speaker
+from app.schemas.enums import Speaker, Treatment
 from app.schemas.preferences import Preferences
 
 log = logging.getLogger(__name__)
@@ -45,6 +47,16 @@ FALLBACK_QUESTIONS = {
     "next_slots": "When is your next available consult appointment?",
     "evening_hours": "Do you have any evening appointments?",
 }
+
+# The opening question when total_price is asked first. {treatment} is what the patient wants.
+OPENING_QUESTIONS = (
+    "What's the total price for {treatment} at your office?",
+    "Could you tell me how much full {treatment} treatment costs with you?",
+    "How much do you charge for {treatment}, start to finish?",
+    "What would the full cost of {treatment} be at your office?",
+)
+TREATMENT_WORDS = {Treatment.BRACES: "braces", Treatment.ALIGNERS: "clear aligners", Treatment.NOT_SURE: "braces"}
+_last_opening: str | None = None  # the wording the last call opened with
 
 MAX_LANA_TURNS = 10  # including the closing line
 MAX_ASKS = 2  # after this many asks a field is left as not confirmed
@@ -84,6 +96,21 @@ def _patient_text(prefs: Preferences) -> str:
             f"- Free times: {', '.join(prefs.free_times) or 'not given'}",
         ]
     )
+
+
+def opening_lines() -> list[str]:
+    """Every first line a call can open with (disclosure plus opening question), for the TTS prewarm."""
+    disclosure = DISCLOSURE.format(agent_name=get_settings().agent_name)
+    words = dict.fromkeys(TREATMENT_WORDS.values())
+    return [f"{disclosure} {q.format(treatment=w)}" for w in words for q in OPENING_QUESTIONS]
+
+
+def _opening(prefs: Preferences) -> str:
+    """An opening price question, never the wording the last call used."""
+    global _last_opening
+    choices = [q for q in OPENING_QUESTIONS if q != _last_opening]
+    _last_opening = random.choice(choices)
+    return _last_opening.format(treatment=TREATMENT_WORDS[prefs.treatment])
 
 
 def _clean(line: str) -> str:
@@ -170,9 +197,11 @@ class Caller:
                 else:
                     await self._say(Speaker.AGENT, CLOSING_LINE)
                 break
-            line = await self._question(fields)
             if self._lana_turns == 0:
-                line = f"{DISCLOSURE.format(agent_name=self._agent_name)} {line}"
+                opening = _opening(self.preferences) if fields[0] == "total_price" else await self._question(fields)
+                line = f"{DISCLOSURE.format(agent_name=self._agent_name)} {opening}"
+            else:
+                line = await self._question(fields)
             self._asks[fields[0]] += 1
             await self._say(Speaker.AGENT, line)
             reply = await receptionist.next_line(line)

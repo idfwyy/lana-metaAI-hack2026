@@ -2,13 +2,16 @@
 // A line's words are revealed while its audio plays, and the next item waits for that
 // audio to end. Other events apply when the timeline reaches them. Every wait has a cap,
 // so the run can never freeze.
+//
+// A line is decoded only once its last frame is in, so every chunk is always played, and
+// its audio may run for its whole decoded length: the cap is that length plus a margin.
 
 import { playLine, stopAllAudio, type PlayingLine } from "./audio";
 import { isLine, type AudioFrame, type LineEvent, type ServerEvent, type ServerMessage } from "./types";
 
 const WORDS_PER_SECOND = 2.6; // text-only reveal speed
 const MUTED_MS_PER_WORD = 40; // stepped away: lines reveal fast so the timeline catches up
-const AUDIO_CAP_MS = 15_000; // audio that hasn't ended 15 s after it started is skipped
+const AUDIO_MARGIN_MS = 3_000; // audio still playing this long past its decoded length is stopped
 const FRAME_WAIT_MS = 12_000; // no audio frame for this long: treat the line as failed
 const GAP_SKIP_MS = 3_000; // a missing seq is skipped after this long
 const TICK_MS = 33;
@@ -20,6 +23,9 @@ interface LineAudio {
   lastFrameAt: number;
 }
 
+/** Decodes and starts one line's audio (audio.ts playLine; a fake in the harness). */
+export type PlayFn = (chunks: string[]) => Promise<PlayingLine>;
+
 export interface PlayerHandlers {
   apply: (event: ServerEvent) => void;
   reveal: (seq: number, count: number) => void;
@@ -28,6 +34,24 @@ export interface PlayerHandlers {
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Where each word starts, as a fraction of the line, weighted by its length: long words take longer to say. */
+export function wordStarts(words: string[]): number[] {
+  const total = words.reduce((n, w) => n + w.length + 1, 0);
+  let at = 0;
+  return words.map((w) => {
+    const start = total ? at / total : 0;
+    at += w.length + 1;
+    return start;
+  });
+}
+
+/** How many words to show once a fraction p of the line has played: every word that has started. */
+export function revealedAt(starts: number[], p: number): number {
+  let n = 0;
+  while (n < starts.length && starts[n] <= p) n++;
+  return Math.max(Math.min(1, starts.length), n);
+}
 
 export class Player {
   private buffer = new Map<number, ServerMessage>();
@@ -39,7 +63,10 @@ export class Player {
   private current: PlayingLine | null = null;
   private muted = false;
 
-  constructor(private readonly handlers: PlayerHandlers) {}
+  constructor(
+    private readonly handlers: PlayerHandlers,
+    private readonly play: PlayFn = playLine,
+  ) {}
 
   /** Stepped away: call audio is skipped and lines reveal quickly. Lana's own lines still play. */
   setMuted(on: boolean): void {
@@ -124,7 +151,7 @@ export class Player {
   }
 
   private async playOne(line: LineEvent, gen: number): Promise<void> {
-    const lana = line.type === "agent_said" || line.speaker === "agent";
+    const lana = line.type === "agent_said" || (line.type === "transcript_final" && line.speaker === "agent");
     if (lana) this.handlers.speaking?.(true);
     try {
       await this.playLineOnce(line, gen);
@@ -135,14 +162,17 @@ export class Player {
 
   private async playLineOnce(line: LineEvent, gen: number): Promise<void> {
     const seq = line.seq!;
-    const words = line.text.split(/\s+/).filter(Boolean).length;
+    const wordList = line.text.split(/\s+/).filter(Boolean);
+    const words = wordList.length;
+    const starts = wordStarts(wordList);
     this.handlers.apply(line);
 
     const chunks = await this.waitForAudio(seq, gen);
     if (gen !== this.gen) return;
 
-    // Muted applies to the calls only; Lana talking to the patient (no call id) always plays.
-    const quiet = this.muted && line.call_id !== null;
+    // Muted applies to the calls only; Lana and the patient talking to each other (no call id) always play.
+    const callId = line.type === "user_said" ? null : line.call_id;
+    const quiet = this.muted && callId !== null;
     if (quiet) {
       for (let i = 1; i <= words && gen === this.gen; i++) {
         this.handlers.reveal(seq, i);
@@ -154,7 +184,7 @@ export class Player {
     let played = false;
     if (chunks) {
       try {
-        const handle = await playLine(chunks);
+        const handle = await this.play(chunks);
         if (gen !== this.gen) {
           handle.stop();
           return;
@@ -162,15 +192,23 @@ export class Player {
         this.current = handle;
         played = true;
         const startedAt = performance.now();
+        const capMs = handle.duration * 1000 + AUDIO_MARGIN_MS;
         let ended = false;
         void handle.ended.then(() => (ended = true));
-        while (!ended && gen === this.gen && performance.now() - startedAt < AUDIO_CAP_MS) {
+        while (!ended && gen === this.gen && performance.now() - startedAt < capMs) {
           const p = handle.duration > 0 ? handle.elapsed() / handle.duration : 1;
-          this.handlers.reveal(seq, Math.min(words, Math.floor(words * p) + 1));
+          this.handlers.reveal(seq, revealedAt(starts, p));
           await sleep(TICK_MS);
         }
         if (!ended) handle.stop();
         this.current = null;
+        if (import.meta.env.DEV) {
+          const playedS = (performance.now() - startedAt) / 1000;
+          console.debug(
+            `[line ${seq}] ${line.text.length} chars, ${handle.bytes} bytes, ` +
+              `decoded ${handle.duration.toFixed(2)} s, played ${playedS.toFixed(2)} s${ended ? "" : " (stopped at the cap)"}`,
+          );
+        }
       } catch {
         played = false;
       }
@@ -183,10 +221,11 @@ export class Player {
       while (gen === this.gen) {
         const p = (performance.now() - startedAt) / total;
         if (p >= 1) break;
-        this.handlers.reveal(seq, Math.min(words, Math.floor(words * p) + 1));
+        this.handlers.reveal(seq, revealedAt(starts, p));
         await sleep(TICK_MS);
       }
     }
+    // The last word shows the moment the audio ends.
     if (gen === this.gen) this.handlers.reveal(seq, words);
   }
 

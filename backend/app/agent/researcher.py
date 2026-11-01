@@ -7,6 +7,7 @@ patient's must-haves first, then rating, then distance.
 import re
 from collections.abc import Callable
 
+from app.agent.intake import CITIES
 from app.config import MISSING_SUBSCORE
 from app.data.loader import get_public_clinics
 from app.schemas.clinic import Clinic
@@ -53,16 +54,24 @@ def _short(clinic: Clinic) -> str:
     return clinic.name.split()[0]
 
 
+def place_name(zip_code: str) -> str:
+    """The DFW city for one of intake's city ZIPs, else the ZIP itself."""
+    return next((name for name, z in CITIES.items() if z == zip_code), zip_code)
+
+
 def _reason(first: Clinic, rest: list[Clinic], preferences: Preferences) -> str:
+    """Why the first clinic is called first, from its public info: 'they fit best (evening hours, 4.9 stars)'."""
+    stars = f"{first.rating:g} stars"
     met = [m for m in preferences.must_haves if _must_have_score(m, first) == 1.0]
     best_fit = fit_score(first, preferences)
     if met and all(best_fit > fit_score(c, preferences) for c in rest):
-        return f"best fit for {', '.join(met)}"
+        return f"they fit best ({', '.join(met)}, {stars})"
     if not rest:
-        return "the only one in range"
+        return f"they're the only one in range ({stars})"
     if all(first.rating > c.rating for c in rest):
-        return "highest rated"
-    return "closest"
+        closest = all(first.distance_mi < c.distance_mi for c in rest)
+        return f"they're the highest rated ({stars}{f', {first.distance_mi:g} mi away' if closest else ''})"
+    return f"they're closest ({first.distance_mi:g} mi)"
 
 
 def pick_clinics(
@@ -71,7 +80,7 @@ def pick_clinics(
     """Clinics within the patient's distance, best fit first. Ties go to the alphabetically first id."""
     log = on_log or (lambda _: None)
     distance = preferences.max_distance_mi
-    miles = f"{distance:g} mile{'s' if distance != 1 else ''}"
+    miles = f"{distance:g} mile{'s' if distance != 1 else ''} of {place_name(preferences.zip_code)}"
     in_range = [c for c in get_public_clinics() if c.distance_mi <= preferences.max_distance_mi]
     if not in_range:
         log(f"No orthodontists found within {miles}")
@@ -82,8 +91,9 @@ def pick_clinics(
     in_range.sort(key=lambda c: (-fit_score(c, preferences), -c.rating, c.distance_mi, c.id))
     picked = in_range[:max_clinics]
 
+    # The browser reads the call order from "Calling X first" and "Then X, then Y" (web/src/lib/clinics.ts).
     first, rest = picked[0], picked[1:]
-    log(f"Calling {_short(first)} first: {_reason(first, rest, preferences)}")
+    log(f"Calling {_short(first)} first, {_reason(first, rest, preferences)}")
     if rest:
         log("Then " + ", then ".join(_short(c) for c in rest))
     return picked
