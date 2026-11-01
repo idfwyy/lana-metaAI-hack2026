@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { motion } from "motion/react";
+import { AnimatePresence, motion } from "motion/react";
 import { CallCard } from "../components/CallCard";
 import { QuoteCard } from "../components/QuoteCard";
 import { SavedCounter } from "../components/SavedCounter";
+import { StepAway } from "../components/StepAway";
 import { Transcript } from "../components/Transcript";
 import { clinicById, shortName } from "../lib/clinics";
 import { clock } from "../lib/format";
@@ -21,7 +22,15 @@ function unfold(i: number) {
 
 type Tab = "call" | "quotes" | "log";
 
-export function Working({ state }: { state: RunState }) {
+interface Props {
+  state: RunState;
+  /** The patient stepped away: the calm screen covers the calls. */
+  away: boolean;
+  onStepAway: () => void;
+  onStepBack: () => void;
+}
+
+export function Working({ state, away, onStepAway, onStepBack }: Props) {
   const wide = useMediaQuery("(min-width: 1024px)");
   const [tab, setTab] = useState<Tab>("call");
   const now = useNow(1000, isLive(state) || Object.values(state.calls).some((c) => c.phase === "on_hold"));
@@ -29,12 +38,18 @@ export function Working({ state }: { state: RunState }) {
   const calls = <CallsList state={state} now={now} />;
   const live = <LiveCall state={state} now={now} />;
   const quotes = <QuotesList state={state} />;
+  const overlay = (
+    <>
+      <AnimatePresence>{away && <StepAway key="away" state={state} onBack={onStepBack} />}</AnimatePresence>
+      {!away && <StepAwayButton onClick={onStepAway} />}
+    </>
+  );
 
   if (wide) {
     return (
       <motion.div
         exit={{ opacity: 0, transition: { duration: 0.18, ease: EASE_OUT } }}
-        className="mx-auto grid h-[calc(100dvh-64px)] w-full max-w-[1440px] grid-cols-[280px_minmax(0,1fr)_320px] gap-6 px-8 py-6"
+        className="relative mx-auto grid h-[calc(100dvh-64px)] w-full max-w-[1440px] grid-cols-[280px_minmax(0,1fr)_320px] gap-6 px-8 py-6"
       >
         <motion.section {...unfold(0)} aria-label="Calls" className="flex min-h-0 flex-col">
           <ColumnTitle>Calls</ColumnTitle>
@@ -47,6 +62,7 @@ export function Working({ state }: { state: RunState }) {
           <ColumnTitle>Quotes</ColumnTitle>
           <div className="scroll-quiet min-h-0 flex-1 overflow-y-auto pb-24">{quotes}</div>
         </motion.section>
+        {overlay}
       </motion.div>
     );
   }
@@ -54,7 +70,7 @@ export function Working({ state }: { state: RunState }) {
   return (
     <motion.div
       exit={{ opacity: 0, transition: { duration: 0.18, ease: EASE_OUT } }}
-      className="flex h-[calc(100dvh-64px)] w-full flex-col"
+      className="relative flex h-[calc(100dvh-64px)] w-full flex-col"
     >
       <motion.div {...unfold(0)} role="tablist" aria-label="Sections" className="flex gap-1 px-4 pt-3">
         {(
@@ -91,7 +107,24 @@ export function Working({ state }: { state: RunState }) {
           </div>
         )}
       </motion.div>
+      {overlay}
     </motion.div>
+  );
+}
+
+/** Leave the calls running and wait for Lana to call back. */
+function StepAwayButton({ onClick }: { onClick: () => void }) {
+  return (
+    <div className="pointer-events-none absolute inset-x-0 bottom-6 z-10 flex justify-center">
+      <motion.button
+        type="button"
+        onClick={onClick}
+        {...unfold(3)}
+        className="pressable pointer-events-auto rounded-full border border-hairline bg-surface px-5 py-2.5 text-[14px] font-medium text-ink shadow-soft hover:border-primary/40"
+      >
+        Step away
+      </motion.button>
+    </div>
   );
 }
 

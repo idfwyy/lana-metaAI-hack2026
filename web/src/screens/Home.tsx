@@ -73,7 +73,7 @@ export function Home({ busy, onMic, onStart, listen, lana, onSay, micLevel, voic
                   <span className="size-1.5 rounded-full bg-primary" aria-hidden />
                   READY
                 </p>
-                {/* TODO(Part 12b): start the calls with these preferences. */}
+                {/* Shown while Lana confirms; the calls start right after her line. */}
                 <PreferenceChips preferences={listen.preferences} draft={listen.draft} />
               </motion.div>
             )}

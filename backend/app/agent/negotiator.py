@@ -8,6 +8,7 @@ import inspect
 import logging
 import math
 import re
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -35,6 +36,9 @@ PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "negotiator.md"
 PROMPT_SPLIT = "<!-- read-reply -->"
 
 MAX_ASKS = 4
+
+# Called the moment the clinic agrees to a move, with the running all-in after it.
+OnConcession = Callable[[Concession, int], None | Awaitable[None]]
 
 
 class MoveKind(StrEnum):
@@ -359,11 +363,13 @@ async def negotiate(
     opening: bool = True,
     opening_line: str | None = None,
     start_t: float = 0.0,
+    on_concession: OnConcession | None = None,
 ) -> NegotiationResult:
     """Ask each move once (at most 4 asks). A no ends that move; the next one is tried.
 
     `opening_line` (e.g. "Thanks for holding.") goes in front of Lana's first line, after the
     disclosure. `start_t` continues a call's clock, so evidence seconds match that call.
+    `on_concession` runs as soon as each concession is won, before the next ask.
     """
     call = _Call(receptionist, on_line, start_t)
     first = target_quote.all_in_price or 0
@@ -407,6 +413,10 @@ async def negotiate(
         concessions.append(concession)
         current -= concession.amount
         matched = matched or move.kind == MoveKind.MATCH
+        if on_concession is not None:
+            result = on_concession(concession, current)
+            if inspect.isawaitable(result):
+                await result
 
     closing = f"{opening_line} {CLOSING_LINE}" if asks == 0 and opening_line else CLOSING_LINE
     await call.say(Speaker.AGENT, closing)

@@ -1,6 +1,7 @@
-// Switches between Home, Working and Done. The mic on Home and the orb in the top bar share
-// a layoutId inside one LayoutGroup, so starting a case morphs one into the other.
-// A patient case stays on Home while Lana listens, and moves on when its Watch run starts.
+// Switches between Home, Working, Callback and Done. The mic on Home and the orb in the top
+// bar share a layoutId inside one LayoutGroup, so starting a case morphs one into the other.
+// A patient case stays on Home through intake and moves on when its calls start. Both modes
+// end with Lana calling back; Done shows once the patient books or saves.
 
 import { useState } from "react";
 import { AnimatePresence, LayoutGroup, MotionConfig, motion } from "motion/react";
@@ -13,18 +14,20 @@ import { startMic } from "./lib/mic";
 import { EASE_OUT } from "./lib/motion";
 import { isLive, statusLine } from "./lib/state";
 import { useCaseRun } from "./lib/useCaseRun";
+import { Callback } from "./screens/Callback";
 import { Done } from "./screens/Done";
 import { Home } from "./screens/Home";
 import { Working } from "./screens/Working";
 
-type View = "home" | "working" | "done" | "error";
+type View = "home" | "working" | "callback" | "done" | "error";
 
 export default function App() {
   const [running, setRunning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [voice, setVoice] = useStoredState("lana.voice", true);
   const [clinics, setClinics] = useStoredState<2 | 3>("lana.clinics", 2);
-  const { state, listen, start, listenTo, sendText, sendAudio, micLevel, stop } = useCaseRun(startOver);
+  const { state, listen, start, listenTo, sendText, sendAudio, micLevel, stop, away, stepAway, stepBack, answer } =
+    useCaseRun(startOver);
 
   async function startWatch() {
     if (busy) return;
@@ -65,10 +68,22 @@ export default function App() {
   }
 
   const failed = state.error !== null || state.caseStatus === "error";
-  const done = state.offers !== null && state.caseStatus === "offers_ready";
+  const done = state.outcome !== null;
+  // Lana rings back once the offers are in, until the patient books or saves.
+  const ringing = state.offers !== null && (state.caseStatus === "offers_ready" || state.caseStatus === "callback");
   // Intake: Lana is talking with the patient on Home; no run has started yet.
   const intake = running && listen.active && state.caseStatus === null;
-  const view: View = !running ? "home" : failed ? "error" : intake ? "home" : done ? "done" : "working";
+  const view: View = !running
+    ? "home"
+    : failed
+      ? "error"
+      : intake
+        ? "home"
+        : done
+          ? "done"
+          : ringing
+            ? "callback"
+            : "working";
   const lana = [...state.lines].reverse().find((l) => l.callId === null) ?? null;
 
   return (
@@ -93,7 +108,7 @@ export default function App() {
                 setClinics={setClinics}
               />
             )}
-            {(view === "working" || view === "done") && (
+            {(view === "working" || view === "callback" || view === "done") && (
               <motion.div key="run" className="flex min-h-dvh flex-col" exit={{ opacity: 0, transition: { duration: 0.16 } }}>
                 <TopBar
                   status={statusLine(state)}
@@ -102,10 +117,14 @@ export default function App() {
                 />
                 <div className="grid flex-1 *:[grid-area:1/1]">
                   <AnimatePresence initial={false}>
-                    {view === "working" ? (
-                      <Working key="working" state={state} />
-                    ) : (
-                      <Done key="done" offers={state.offers ?? []} onStartOver={startOver} />
+                    {view === "working" && (
+                      <Working key="working" state={state} away={away} onStepAway={stepAway} onStepBack={stepBack} />
+                    )}
+                    {view === "callback" && (
+                      <Callback key="callback" lines={state.lines} listen={listen} onAnswer={answer} onSay={sendText} />
+                    )}
+                    {view === "done" && (
+                      <Done key="done" offers={state.offers ?? []} outcome={state.outcome} onStartOver={startOver} />
                     )}
                   </AnimatePresence>
                 </div>

@@ -16,7 +16,7 @@ You read one reply from a patient talking to {agent_name}, an AI assistant who h
 
 - treatment: "braces", "aligners" (clear aligners, Invisalign) or "not sure". Use "not sure" only if the patient says they don't know which one.
 - zip_code: a 5 digit ZIP code, only if the patient said one.
-- city: the city or area name exactly as the patient said it, for example "Dallas", only if they named a place.
+- city: the city or area name exactly as the patient said it, for example "Dallas", only if they named a place. Speech recognition sometimes mishears a city as another word (for example "LinkedIn" for "Arlington"); if the patient was answering where to search, give the word they said as city anyway.
 - max_distance_mi: how many miles the patient will travel, only if they said a distance.
 - budget: the most the patient wants to spend in total, in the patient's own words, for example "5k", "under five thousand", "4,500". Leave out monthly amounts.
 - prefers_monthly: true if the patient wants monthly payments, false if they say they don't.
@@ -41,10 +41,17 @@ You read one reply from a patient talking to {agent_name}, an AI assistant who h
 
 - greeting: Hey, I'm {agent_name}, your personal health companion! What do you need help with?
 - treatment: Are you looking for braces, clear aligners, or not sure yet?
-- location: What ZIP code or city should I search near?
+- location: Which city or ZIP code should I search near?
 - budget: What's the most you'd want to spend in total?
 - pay: How would you like to pay: monthly, in full if it's cheaper, or with an HSA or FSA?
 - records: Do you already have x-rays or a treatment plan from a dentist?
 - must_haves: Is there anything a clinic must have, like evening hours?
 - no_advice: I can't advise on treatment, but a dentist or orthodontist can.
-- confirm: Got it. {summary}. I'll start calling now.
+- confirm: Got it. {summary}. I'm calling clinics now. You can watch, or step away and I'll call you back.
+- fuzzy_city: {city}, got it.
+- default_treatment: I'll look at both braces and aligners for now.
+- default_location: I'll search near Arlington for now.
+- default_budget: I'll leave the budget open for now.
+- default_pay: I'll ask about every way to pay.
+- default_records: I'll assume no x-rays yet.
+- default_must_haves: No must-haves, then.

@@ -1,5 +1,7 @@
 """Orchestrator and researcher with the caller, simulator and LLM mocked. No network."""
 
+from datetime import datetime
+
 import pytest
 
 from app.agent import negotiator, orchestrator
@@ -11,7 +13,11 @@ from app.agent.orchestrator import (
     RESUME_LINE,
     IllegalTransition,
     Orchestrator,
+    spoken_slot,
+    template_summary,
+    write_summary,
 )
+from app.agent.negotiator import CLOSING_LINE as NEGOTIATION_CLOSING
 from app.agent.researcher import pick_clinics
 from app.clinics.simulator import is_hold_request
 from app.config import get_settings
@@ -19,6 +25,8 @@ from app.schemas.case import Case
 from app.schemas.checklist import ClinicChecklist, SourcedAnswer
 from app.schemas.enums import CallStatus, CaseStatus, Speaker, Treatment
 from app.schemas.events import (
+    Booked,
+    CallbackStarted,
     CallStatusEvent,
     CaseStatusEvent,
     ConcessionWon,
@@ -29,6 +37,7 @@ from app.schemas.events import (
 from app.schemas.preferences import Preferences
 
 S = CaseStatus
+TZ = get_settings().tz
 
 
 def _prefs(**overrides) -> Preferences:
@@ -151,6 +160,8 @@ def world(monkeypatch: pytest.MonkeyPatch) -> World:
     # Phrasing falls back to the fixed templates; replies are read from the script.
     monkeypatch.setattr(negotiator, "stream_chat", broken_chat)
     monkeypatch.setattr(negotiator, "call_json", fake_json)
+    # The callback summary falls back to its template.
+    monkeypatch.setattr(orchestrator, "stream_chat", broken_chat)
     return w
 
 
@@ -401,3 +412,112 @@ async def test_exception_moves_case_to_error(world: World) -> None:
     assert "Traceback" not in events[-1].message
     assert case.error == events[-1].message
     assert not any(isinstance(e, OffersReady) for e in events)
+
+
+# ---------- live price drops ----------
+
+
+async def test_concession_won_is_emitted_during_the_negotiation_call(world: World) -> None:
+    _win_on_parkway(world)
+
+    case, events = await _run()
+
+    call_id = _call_ids(events, "parkway")[0]
+    won = _index(events, lambda e: isinstance(e, ConcessionWon))
+    ended = _index(
+        events, lambda e: isinstance(e, CallStatusEvent) and e.call_id == call_id and e.status == CallStatus.ENDED
+    )
+    closing = _index(events, lambda e: isinstance(e, TranscriptFinal) and e.text == NEGOTIATION_CLOSING)
+    pay_in_full_ask = _index(
+        events, lambda e: isinstance(e, TranscriptFinal) and e.speaker == Speaker.AGENT and "pays in full" in e.text
+    )
+    assert len(won) == 2
+    # The match drops the price before Lana even asks for the pay-in-full discount.
+    assert won[0] < pay_in_full_ask[0] < won[1]
+    assert won[-1] < closing[0] < ended[-1]
+
+
+# ---------- the callback ----------
+
+
+def _with_slots(case: Case) -> None:
+    quote = case.offers[0].quote
+    slots = [datetime(2026, 11, 4, 18, 0, tzinfo=TZ), datetime(2026, 11, 3, 17, 30, tzinfo=TZ)]
+    quote.checklist.next_slots = _answer(slots, "Tuesday at 5:30", "c1", 3.0)
+
+
+async def _ready(world: World) -> tuple[Orchestrator, list]:
+    _win_on_parkway(world)
+    events: list = []
+    orch = Orchestrator(Case(preferences=_prefs()), events.append)
+    await orch.run()
+    return orch, events
+
+
+async def test_summary_with_a_made_up_number_falls_back_to_the_template(world: World, monkeypatch) -> None:
+    orch, _ = await _ready(world)
+
+    async def chat(messages, model, reasoning=None):
+        yield "Parkway Orthodontics came in at $3,990 all in, so you save $9,999."
+
+    monkeypatch.setattr(orchestrator, "stream_chat", chat)
+    summary = await write_summary(orch.case)
+
+    assert "$9,999" not in summary
+    assert summary == template_summary(orch.case)
+    assert summary.startswith("Parkway Orthodontics came in at $3,990 all in.")
+    assert "$1,060" in summary  # saved: 5,050 - 3,990
+
+
+async def test_clean_summary_is_kept(world: World, monkeypatch) -> None:
+    orch, _ = await _ready(world)
+    clean = "Hi, it's Lana. Parkway Orthodontics came down from $5,050 to $3,990 all in, a $1,060 saving."
+
+    async def chat(messages, model, reasoning=None):
+        yield clean
+
+    monkeypatch.setattr(orchestrator, "stream_chat", chat)
+    assert await write_summary(orch.case) == clean
+
+
+async def test_start_callback_rings_with_the_summary(world: World) -> None:
+    orch, events = await _ready(world)
+
+    summary = await orch.start_callback()
+
+    assert orch.case.status == S.CALLBACK and orch.summary == summary
+    assert isinstance(events[-1], CallbackStarted) and events[-1].summary == summary
+    assert summary == template_summary(orch.case)  # the model is broken in these tests
+
+
+async def test_yes_books_the_first_open_slot(world: World) -> None:
+    orch, events = await _ready(world)
+    await orch.start_callback()
+    _with_slots(orch.case)
+
+    booked = await orch.book()
+
+    assert booked is not None and isinstance(events[-1], Booked)
+    assert booked.clinic_id == "parkway"
+    assert booked.slot == datetime(2026, 11, 3, 17, 30, tzinfo=TZ)
+    assert booked.total_saved == 1060
+    assert orch.case.status == S.BOOKED
+    assert spoken_slot(booked.slot) == "Tuesday, November 3 at 5:30 PM"
+
+
+async def test_no_slot_means_no_booking(world: World) -> None:
+    orch, _ = await _ready(world)
+    await orch.start_callback()
+
+    assert await orch.book() is None
+    assert orch.case.status == S.CALLBACK
+
+
+async def test_not_yet_saves(world: World) -> None:
+    orch, events = await _ready(world)
+    await orch.start_callback()
+
+    await orch.save()
+
+    assert orch.case.status == S.SAVED
+    assert _statuses(events)[-1] == S.SAVED

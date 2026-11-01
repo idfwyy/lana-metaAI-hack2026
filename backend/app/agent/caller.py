@@ -181,10 +181,12 @@ class Caller:
         return CallResult(transcript=self.transcript, checklist=self.checklist)
 
     def _fields_to_ask(self) -> list[str]:
+        """Missing fields from DEMO_CHECKLIST, in order. The extractor still fills the others."""
+        asked = get_settings().demo_fields
         return [
             name
             for name in CHECKLIST_ORDER
-            if getattr(self.checklist, name) is None and self._asks[name] < MAX_ASKS
+            if name in asked and getattr(self.checklist, name) is None and self._asks[name] < MAX_ASKS
         ]
 
     async def _question(self, fields: list[str]) -> str:

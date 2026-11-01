@@ -130,7 +130,12 @@ async def test_first_line_is_exact_disclosure_then_question(chat, no_extraction)
     )
 
 
-async def test_stops_after_ten_lana_turns(chat, no_extraction) -> None:
+@pytest.fixture
+def full_checklist(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(get_settings(), "demo_checklist", ",".join(CHECKLIST_ORDER))
+
+
+async def test_stops_after_ten_lana_turns(chat, no_extraction, full_checklist) -> None:
     lines, on_line = _recorder()
     receptionist = FakeReceptionist()
 
@@ -143,11 +148,26 @@ async def test_stops_after_ten_lana_turns(chat, no_extraction) -> None:
     assert len(result.transcript.lines) == len(lines) == 2 * MAX_LANA_TURNS - 1
 
 
-async def test_each_field_asked_at_most_twice_in_order(chat, no_extraction) -> None:
+async def test_each_field_asked_at_most_twice_in_order(chat, no_extraction, full_checklist) -> None:
     await Caller(_clinic(), PREFS, lambda *a: None).run(FakeReceptionist())
 
     expected = [f for f in CHECKLIST_ORDER for _ in range(2)][: MAX_LANA_TURNS - 1]
     assert chat.asked_fields() == expected
+
+
+async def test_demo_checklist_limits_the_questions(chat, no_extraction) -> None:
+    assert get_settings().demo_checklist == "total_price,records_fee,monthly_payment,next_slots"
+    await Caller(_clinic(), PREFS, lambda *a: None).run(FakeReceptionist())
+
+    expected = ["total_price", "records_fee", "monthly_payment", "next_slots"]
+    assert chat.asked_fields() == [f for f in expected for _ in range(2)]
+
+
+async def test_custom_demo_checklist_is_respected(chat, no_extraction, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(get_settings(), "demo_checklist", "next_slots,total_price")
+    await Caller(_clinic(), PREFS, lambda *a: None).run(FakeReceptionist())
+
+    assert chat.asked_fields() == ["total_price", "total_price", "next_slots", "next_slots"]
 
 
 async def test_ends_when_all_fields_filled(chat, monkeypatch: pytest.MonkeyPatch) -> None:

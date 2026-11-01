@@ -5,7 +5,17 @@ import { AnimatedNumber } from "../components/AnimatedNumber";
 import { SavingsBreakdown } from "../components/SavingsBreakdown";
 import { clock, humanize, money } from "../lib/format";
 import { EASE_DRAWER, EASE_IN_OUT, EASE_OUT } from "../lib/motion";
+import type { Outcome } from "../lib/state";
 import type { Offer } from "../lib/types";
+
+/** "Tue, Nov 3 · 5:30 PM" in the demo clinics' time zone. */
+function slotLabel(iso: string): string {
+  const d = new Date(iso);
+  const timeZone = "America/Chicago";
+  const day = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone });
+  const time = d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone });
+  return `${day} · ${time}`;
+}
 
 const settle = { duration: 0.36, ease: EASE_IN_OUT };
 
@@ -17,7 +27,14 @@ function enter(delay: number) {
   };
 }
 
-export function Done({ offers, onStartOver }: { offers: Offer[]; onStartOver: () => void }) {
+interface Props {
+  offers: Offer[];
+  /** How Lana's callback ended. */
+  outcome: Outcome | null;
+  onStartOver: () => void;
+}
+
+export function Done({ offers, outcome, onStartOver }: Props) {
   const [top, ...others] = offers;
 
   if (!top) {
@@ -37,6 +54,7 @@ export function Done({ offers, onStartOver }: { offers: Offer[]; onStartOver: ()
 
   return (
     <main className="mx-auto w-full max-w-[640px] px-4 pb-20 pt-10 text-center sm:pt-14">
+      {outcome && <OutcomeLine outcome={outcome} />}
       <motion.h2 layoutId={`name-${clinic.id}`} transition={settle} className="text-[24px] font-semibold leading-[1.2] sm:text-[28px]">
         {clinic.name}
       </motion.h2>
@@ -101,6 +119,24 @@ export function Done({ offers, onStartOver }: { offers: Offer[]; onStartOver: ()
         <StartOver onClick={onStartOver} />
       </motion.div>
     </main>
+  );
+}
+
+function OutcomeLine({ outcome }: { outcome: Outcome }) {
+  return (
+    <motion.div {...enter(0)} className="mb-6 flex flex-col items-center gap-1">
+      {outcome.kind === "booked" ? (
+        <>
+          <p className="inline-flex items-center gap-2 rounded-full bg-primary-soft px-3 py-1.5 text-[14px] font-medium text-primary">
+            <span className="size-1.5 rounded-full bg-primary" aria-hidden />
+            Booked (demo clinic)
+          </p>
+          <p className="mt-1 font-mono text-[15px] text-ink tnum">{slotLabel(outcome.slot)}</p>
+        </>
+      ) : (
+        <p className="max-w-[40ch] text-[15px] text-muted">Saved, not booked. I'll hold this quote for you.</p>
+      )}
+    </motion.div>
   );
 }
 

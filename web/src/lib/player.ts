@@ -7,6 +7,7 @@ import { playLine, stopAllAudio, type PlayingLine } from "./audio";
 import { isLine, type AudioFrame, type LineEvent, type ServerEvent, type ServerMessage } from "./types";
 
 const WORDS_PER_SECOND = 2.6; // text-only reveal speed
+const MUTED_MS_PER_WORD = 40; // stepped away: lines reveal fast so the timeline catches up
 const AUDIO_CAP_MS = 15_000; // audio that hasn't ended 15 s after it started is skipped
 const FRAME_WAIT_MS = 12_000; // no audio frame for this long: treat the line as failed
 const GAP_SKIP_MS = 3_000; // a missing seq is skipped after this long
@@ -36,8 +37,15 @@ export class Player {
   private gapTimer: ReturnType<typeof setTimeout> | null = null;
   private gen = 0;
   private current: PlayingLine | null = null;
+  private muted = false;
 
   constructor(private readonly handlers: PlayerHandlers) {}
+
+  /** Stepped away: call audio is skipped and lines reveal quickly. Lana's own lines still play. */
+  setMuted(on: boolean): void {
+    this.muted = on;
+    if (on) this.current?.stop();
+  }
 
   push(m: ServerMessage): void {
     if (m.type === "audio") this.storeFrame(m);
@@ -132,6 +140,16 @@ export class Player {
 
     const chunks = await this.waitForAudio(seq, gen);
     if (gen !== this.gen) return;
+
+    // Muted applies to the calls only; Lana talking to the patient (no call id) always plays.
+    const quiet = this.muted && line.call_id !== null;
+    if (quiet) {
+      for (let i = 1; i <= words && gen === this.gen; i++) {
+        this.handlers.reveal(seq, i);
+        await sleep(MUTED_MS_PER_WORD);
+      }
+      return;
+    }
 
     let played = false;
     if (chunks) {

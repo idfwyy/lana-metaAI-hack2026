@@ -199,10 +199,10 @@ export interface IntakeUpdate extends Base {
   draft: PreferencesDraft;
   preferences?: Preferences;
 }
-/** A spoken command the browser acts on itself. */
+/** A spoken command the browser acts on itself: start over, or step away while the calls run. */
 export interface CommandEvent extends Base {
   type: "command";
-  name: "start_over" | string;
+  name: "start_over" | "step_away" | string;
 }
 
 /** audio_bus: frames for one line, pointing back to it with line_seq. */
@@ -250,4 +250,6 @@ export type ClientMessage =
   | { type: "listen" }
   | { type: "stop" }
   | { type: "user_text"; text: string }
-  | { type: "command"; name: string };
+  | { type: "command"; name: "step_away" | "step_back" | string }
+  /** Pick up Lana's callback (auto after 3 s of ringing). */
+  | { type: "answer" };

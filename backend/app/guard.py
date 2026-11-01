@@ -31,7 +31,7 @@ class CaseUsage:
     case_id: str
     llm_calls: int = 0
     tts_chars: int = 0
-    stt_seconds: float = 0.0  # audio sent to Meta STT, silence included
+    stt_seconds: float = 0.0  # real mic audio sent to Meta STT
     hit: str | None = None  # "llm", "tts" or "stt" once a limit is reached
     on_limit: Callable[[], object] | None = None  # cancels the run
 
@@ -99,7 +99,7 @@ def charge_tts(chars: int) -> None:
 
 
 def charge_stt(seconds: float) -> None:
-    """Count audio seconds sent to Meta STT. Raises LimitHit once the case would go over its limit."""
+    """Count seconds of real mic audio sent to Meta STT. Raises LimitHit once the case would go over its limit."""
     usage = _usage.get()
     if usage is None:
         return

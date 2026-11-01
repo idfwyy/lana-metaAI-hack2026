@@ -113,3 +113,39 @@ export function stopAllAudio(): void {
   }
   playing.clear();
 }
+
+const RING_EVERY_MS = 1600;
+
+/** A soft two-note chime for Lana's incoming call, repeated until the returned stop() runs. */
+export function startRing(): () => void {
+  const c = context();
+  if (!c) return () => {};
+  if (c.state === "suspended") void c.resume().catch(() => {});
+  const gain = c.createGain();
+  gain.gain.value = 0.12;
+  gain.connect(c.destination);
+
+  const chime = () => {
+    if (c.state !== "running") return;
+    [660, 880].forEach((freq, i) => {
+      const at = c.currentTime + i * 0.18;
+      const osc = c.createOscillator();
+      const env = c.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      env.gain.setValueAtTime(0, at);
+      env.gain.linearRampToValueAtTime(1, at + 0.02);
+      env.gain.exponentialRampToValueAtTime(0.001, at + 0.8);
+      osc.connect(env).connect(gain);
+      osc.start(at);
+      osc.stop(at + 0.85);
+    });
+  };
+  chime();
+  const id = setInterval(chime, RING_EVERY_MS);
+  return () => {
+    clearInterval(id);
+    gain.gain.setTargetAtTime(0, c.currentTime, 0.05);
+    setTimeout(() => gain.disconnect(), 300);
+  };
+}

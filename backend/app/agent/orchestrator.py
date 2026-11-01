@@ -1,13 +1,17 @@
 """State machine for the whole case. Owns the Case, decides every next step, emits every event.
 
 Plain Python decides the call order, when to hold and resume, and who to negotiate with.
-AI runs only inside the steps it calls (caller, extractor, negotiator phrasing, tradeoffs).
+AI runs only inside the steps it calls (caller, extractor, negotiator phrasing, tradeoffs,
+the callback summary).
 """
 
 import inspect
 import logging
+import re
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import datetime
+from pathlib import Path
 
 from pydantic import BaseModel
 
@@ -16,13 +20,17 @@ from app.agent.extractor import build_quote
 from app.agent.negotiator import MoveKind, negotiate, pick_target, plan_moves
 from app.agent.ranker import add_tradeoffs, rank_offers
 from app.agent.researcher import pick_clinics
-from app.clinics.simulator import ClinicSimulator
+from app.clinics.simulator import ClinicSimulator, dollar_amounts
+from app.config import get_settings
 from app.data.loader import load_demo_clinics
+from app.integrations.meta_llm import stream_chat
 from app.schemas.case import Case
 from app.schemas.checklist import ClinicChecklist
 from app.schemas.clinic import Clinic, PriceSheet
 from app.schemas.enums import CallStatus, CaseStatus, Speaker
 from app.schemas.events import (
+    Booked,
+    CallbackStarted,
     CallStatusEvent,
     CaseStatusEvent,
     ConcessionWon,
@@ -32,7 +40,8 @@ from app.schemas.events import (
     QuoteUpdated,
     TranscriptFinal,
 )
-from app.schemas.negotiation import NegotiationResult
+from app.schemas.negotiation import Concession, NegotiationResult
+from app.schemas.offer import Offer
 from app.schemas.quote import Quote
 
 log = logging.getLogger(__name__)
@@ -66,6 +75,13 @@ RESUME_CLOSE_LINE = (
     "patient. Thank you so much for your help!"
 )
 
+SUMMARY_PROMPT = Path(__file__).resolve().parents[1] / "prompts" / "summary.md"
+# Said when the model's summary fails the number check, errors or comes back empty.
+SUMMARY_TEMPLATE = "{clinic} came in at ${final:,} all in."
+SUMMARY_SAVED = " I got it down from ${first:,}, so you save ${saved:,}."
+SUMMARY_SLOT = " Their next opening is {slot}."
+NO_OFFER_SUMMARY = "I called the clinics, but none confirmed a price within what you asked for."
+
 Emit = Callable[[BaseModel], None | Awaitable[None]]
 
 
@@ -79,6 +95,108 @@ class CaseFailed(Exception):
 
 def _short(name: str) -> str:
     return name.split()[0]
+
+
+def spoken_slot(slot: datetime) -> str:
+    """'Tuesday, November 4 at 5:30 PM' in the clinics' time zone."""
+    local = slot.astimezone(get_settings().tz)
+    return f"{local:%A, %B} {local.day} at {local.hour % 12 or 12}:{local:%M %p}"
+
+
+def first_slot(offer: Offer) -> datetime | None:
+    slots = offer.quote.checklist.next_slots
+    return min(slots.value) if slots is not None and slots.value else None
+
+
+def _final_all_in(offer: Offer) -> int | None:
+    return offer.negotiation.final_all_in if offer.negotiation is not None else offer.quote.all_in_price
+
+
+def allowed_amounts(case: Case) -> set[int]:
+    """Every dollar amount the summary may say: what the clinics quoted and what Lana won."""
+    amounts: set[int] = set()
+    for quote in case.quotes:
+        if quote.all_in_price is not None:
+            amounts.add(quote.all_in_price)
+        c = quote.checklist
+        for answer in (c.total_price, c.records_fee, c.consult_fee, c.monthly_payment, c.down_payment):
+            if answer is not None:
+                amounts.add(answer.value)
+    deals = [case.negotiation] if case.negotiation else []
+    deals += [o.negotiation for o in case.offers if o.negotiation is not None]
+    for deal in deals:
+        amounts |= {deal.first_all_in, deal.final_all_in, deal.total_saved}
+        amounts |= {c.amount for c in deal.concessions if c.amount}
+    return amounts
+
+
+def summary_problem(case: Case, text: str) -> str | None:
+    """Why the summary can't be said, or None. Every dollar amount must be in the case's data."""
+    if not text.strip():
+        return "empty summary"
+    allowed = allowed_amounts(case)
+    for amount in dollar_amounts(text):
+        if amount not in allowed:
+            return f"amount ${amount:,} is not in the offers"
+    return None
+
+
+def template_summary(case: Case) -> str:
+    if not case.offers or _final_all_in(case.offers[0]) is None:
+        return NO_OFFER_SUMMARY
+    top = case.offers[0]
+    text = SUMMARY_TEMPLATE.format(clinic=top.clinic.name, final=_final_all_in(top))
+    if top.negotiation is not None and top.negotiation.total_saved > 0:
+        text += SUMMARY_SAVED.format(first=top.negotiation.first_all_in, saved=top.negotiation.total_saved)
+    slot = first_slot(top)
+    if slot is not None:
+        text += SUMMARY_SLOT.format(slot=spoken_slot(slot))
+    return text
+
+
+def _summary_facts(case: Case) -> str:
+    top = case.offers[0]
+    facts = [f"- Best clinic: {top.clinic.name}", f"- Its final all-in price: ${_final_all_in(top):,}"]
+    deal = top.negotiation
+    if deal is not None and deal.total_saved > 0:
+        facts.append(f"- Its price before {get_settings().agent_name} negotiated: ${deal.first_all_in:,}")
+        facts.append(f"- Total saved: ${deal.total_saved:,}")
+        facts += [f"- Won: {c.label}" + (f" (${c.amount:,})" if c.amount else "") for c in deal.concessions]
+    monthly = top.quote.checklist.monthly_payment
+    if monthly is not None:
+        facts.append(f"- Monthly payment: ${monthly.value:,}")
+    slot = first_slot(top)
+    if slot is not None:
+        facts.append(f"- Next opening: {spoken_slot(slot)}")
+    for other in case.offers[1:]:
+        price = _final_all_in(other)
+        if price is not None:
+            facts.append(f"- Also called: {other.clinic.name}, ${price:,} all in")
+    return "\n".join(facts)
+
+
+async def write_summary(case: Case) -> str:
+    """Lana's callback summary from MODEL_SMART, checked in Python; the template if it fails."""
+    if not case.offers or _final_all_in(case.offers[0]) is None:
+        return template_summary(case)
+    settings = get_settings()
+    prompt = SUMMARY_PROMPT.read_text(encoding="utf-8").format(
+        agent_name=settings.agent_name, facts=_summary_facts(case)
+    )
+    try:
+        stream = stream_chat(
+            [{"role": "user", "content": prompt}], settings.model_smart, reasoning=settings.call_reasoning
+        )
+        text = "".join([c async for c in stream]).strip().strip('"').strip()
+    except Exception as err:
+        log.warning("case=%s summary failed, using the template: %s", case.id, err)
+        return template_summary(case)
+    text = re.sub(r"\s*—\s*", ", ", text)
+    problem = summary_problem(case, text)
+    if problem is not None:
+        log.warning("case=%s summary rejected (%s): %r", case.id, problem, text)
+        return template_summary(case)
+    return text
 
 
 class _Call:
@@ -130,6 +248,7 @@ class Orchestrator:
         self.max_clinics = max_clinics
         self._step = "starting the case"
         self._sheets: dict[str, PriceSheet] = {}
+        self.summary: str | None = None  # set by start_callback()
 
     # ---------- states ----------
 
@@ -304,6 +423,17 @@ class Orchestrator:
         else:
             await self._log(f"Negotiating with {name}")
 
+        async def on_concession(concession: Concession, new_all_in: int) -> None:
+            # The price drops on screen the moment the clinic agrees, while the call goes on.
+            await self._emit(
+                ConcessionWon(
+                    case_id=self.case.id,
+                    clinic_id=call.clinic.id,
+                    concession=concession,
+                    new_all_in=new_all_in,
+                )
+            )
+
         await call.status(CallStatus.NEGOTIATING)
         result = await negotiate(
             quote,
@@ -314,20 +444,9 @@ class Orchestrator:
             opening=not resumed,
             opening_line=RESUME_LINE if resumed else None,
             start_t=call.clock,
+            on_concession=on_concession,
         )
         await call.status(CallStatus.ENDED)
-
-        running = result.first_all_in
-        for concession in result.concessions:
-            running -= concession.amount
-            await self._emit(
-                ConcessionWon(
-                    case_id=self.case.id,
-                    clinic_id=call.clinic.id,
-                    concession=concession,
-                    new_all_in=running,
-                )
-            )
         await self._log(f"Saved ${result.total_saved:,} with {name}")
         return result
 
@@ -348,3 +467,30 @@ class Orchestrator:
         self.case.offers = offers
         await self._emit(OffersReady(case_id=self.case.id, offers=offers))
         await self.advance(S.OFFERS_READY)
+
+    # ---------- the callback ----------
+
+    async def start_callback(self) -> str:
+        """OFFERS_READY -> CALLBACK: write Lana's summary and tell the browser to ring."""
+        self._step = "writing the summary"
+        await self.advance(S.CALLBACK)
+        self.summary = await write_summary(self.case)
+        await self._emit(CallbackStarted(case_id=self.case.id, summary=self.summary))
+        return self.summary
+
+    async def book(self) -> Booked | None:
+        """CALLBACK -> BOOKED at the winner's first open slot. None if it gave no slot."""
+        top = self.case.offers[0] if self.case.offers else None
+        slot = first_slot(top) if top is not None else None
+        if top is None or slot is None:
+            return None
+        deal = top.negotiation
+        saved = deal.total_saved if deal is not None and deal.clinic_id == top.clinic.id else 0
+        await self.advance(S.BOOKED)
+        booked = Booked(case_id=self.case.id, clinic_id=top.clinic.id, slot=slot, total_saved=saved)
+        await self._emit(booked)
+        return booked
+
+    async def save(self) -> None:
+        """CALLBACK -> SAVED: the patient said not yet; the quote is kept, nothing is booked."""
+        await self.advance(S.SAVED)

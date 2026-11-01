@@ -1,10 +1,12 @@
 // One case on one socket: socket in, player in the middle, reducers out.
 // A Watch case opens with start. A patient case opens with listen: Lana greets, the mic
-// streams to the server, and the listen state below drives Home until a Watch run starts.
+// streams to the server, and the listen state below drives Home through intake. When intake
+// is done the calls start and the mic stays open for "I'll wait". At the end Lana calls back:
+// answer() picks up, and the listen state drives the callback's captions.
 
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { toast } from "sonner";
-import type { Mic } from "./mic";
+import { startMic, type Mic } from "./mic";
 import { Player } from "./player";
 import { CaseSocket } from "./socket";
 import { initialRun, runReducer, type RunState } from "./state";
@@ -28,6 +30,8 @@ export interface ListenState {
   done: boolean;
   draft: PreferencesDraft;
   preferences: Preferences | null;
+  /** Lana's callback was answered: she waits on "book it" or "not yet". */
+  callback: boolean;
 }
 
 export const initialListen: ListenState = {
@@ -42,10 +46,12 @@ export const initialListen: ListenState = {
   done: false,
   draft: {},
   preferences: null,
+  callback: false,
 };
 
 type ListenAction =
   | { kind: "listen" }
+  | { kind: "callback" }
   | { kind: "mic"; mic: ListenState["mic"]; fallback?: boolean }
   | { kind: "speaking"; on: boolean }
   | { kind: "event"; event: ServerEvent }
@@ -57,6 +63,8 @@ function listenReducer(state: ListenState, action: ListenAction): ListenState {
       return initialListen;
     case "listen":
       return { ...initialListen, active: true, mic: "starting" };
+    case "callback":
+      return { ...state, active: true, callback: true, partial: "", heard: null, thinking: false };
     case "mic":
       return { ...state, mic: action.mic, fallback: state.fallback || !!action.fallback };
     case "speaking":
@@ -68,8 +76,8 @@ function listenReducer(state: ListenState, action: ListenAction): ListenState {
     case "user_partial":
       return { ...state, partial: e.text, heard: null };
     case "user_said":
-      // Once intake is done Lana answers only commands, so nothing else waits on her.
-      return { ...state, partial: "", heard: e.text, thinking: !state.done };
+      // During the calls nothing waits on her; in intake and the callback her reply comes next.
+      return { ...state, partial: "", heard: e.text, thinking: !state.done || state.callback };
     case "agent_said":
       return e.call_id === null ? { ...state, thinking: false } : state;
     case "intake":
@@ -92,9 +100,16 @@ export function useCaseRun(onStartOver?: () => void): {
   sendAudio: (frame: ArrayBuffer) => void;
   micLevel: () => number;
   stop: () => void;
+  /** The patient stepped away: call audio muted, the calm screen shows. */
+  away: boolean;
+  stepAway: () => void;
+  stepBack: () => void;
+  /** Pick up Lana's callback. */
+  answer: () => void;
 } {
   const [state, dispatch] = useReducer(runReducer, initialRun);
   const [listen, listenDispatch] = useReducer(listenReducer, initialListen);
+  const [away, setAway] = useState(false);
   const socket = useRef<CaseSocket | null>(null);
   const player = useRef<Player | null>(null);
   const mic = useRef<Mic | null>(null);
@@ -115,6 +130,14 @@ export function useCaseRun(onStartOver?: () => void): {
     player.current = null;
     dispatch({ kind: "reset" });
     listenDispatch({ kind: "reset" });
+    setAway(false);
+  }, [stopMic]);
+
+  /** Mute the calls locally; the server stops voicing them too. */
+  const goAway = useCallback(() => {
+    player.current?.setMuted(true);
+    stopMic(); // the server stops listening; the callback opens the mic again
+    setAway(true);
   }, [stopMic]);
 
   const open = useCallback(
@@ -127,6 +150,8 @@ export function useCaseRun(onStartOver?: () => void): {
           if (event.type === "stt_unavailable") stopMic();
           // Let the player finish this step before Start over tears it down.
           if (event.type === "command" && event.name === "start_over") queueMicrotask(() => startOver.current?.());
+          // The patient said "I'll wait".
+          if (event.type === "command" && event.name === "step_away") goAway();
         },
         reveal: (seq, count) => dispatch({ kind: "reveal", seq, count }),
         speaking: (on) => {
@@ -165,7 +190,7 @@ export function useCaseRun(onStartOver?: () => void): {
       s.open();
       return s;
     },
-    [stop, stopMic],
+    [stop, stopMic, goAway],
   );
 
   const start = useCallback((caseId: string) => void open(caseId, { type: "start" }), [open]);
@@ -196,12 +221,50 @@ export function useCaseRun(onStartOver?: () => void): {
   const sendAudio = useCallback((frame: ArrayBuffer) => socket.current?.sendAudio(frame), []);
   const micLevel = useCallback(() => mic.current?.level() ?? 0, []);
 
-  // A Watch run started (the patient said "just show me"): the mic's job is done.
-  useEffect(() => {
-    if (state.caseStatus !== null) stopMic();
-  }, [state.caseStatus, stopMic]);
+  const stepAway = useCallback(() => {
+    socket.current?.send({ type: "command", name: "step_away" });
+    goAway();
+  }, [goAway]);
 
-  const finished = (state.offers !== null && state.caseStatus === "offers_ready") || state.error !== null;
+  const stepBack = useCallback(() => {
+    socket.current?.send({ type: "command", name: "step_back" });
+    player.current?.setMuted(false);
+    setAway(false);
+  }, []);
+
+  const answer = useCallback(() => {
+    const s = socket.current;
+    if (!s) return;
+    player.current?.setMuted(false);
+    setAway(false);
+    listenDispatch({ kind: "callback" });
+    s.send({ type: "answer" });
+    if (mic.current) return;
+    // Open the mic only if this site may already use it: no permission prompt mid-call.
+    const granted = navigator.permissions
+      ? navigator.permissions.query({ name: "microphone" as PermissionName }).then((p) => p.state === "granted", () => false)
+      : Promise.resolve(false);
+    void granted.then((ok) => {
+      if (!ok || socket.current !== s) return;
+      startMic(sendAudio).then(
+        (m) => {
+          if (socket.current !== s) return m.stop();
+          mic.current = m;
+          if (lanaSpeaking.current) m.pause();
+          listenDispatch({ kind: "mic", mic: "on" });
+        },
+        () => listenDispatch({ kind: "mic", mic: "off", fallback: true }),
+      );
+    });
+  }, [sendAudio]);
+
+  // A Watch run started (the patient said "just show me"): the mic's job is done. After the
+  // patient's own intake it stays open, so they can say "I'll wait".
+  useEffect(() => {
+    if (state.caseStatus !== null && !listen.done) stopMic();
+  }, [state.caseStatus, listen.done, stopMic]);
+
+  const finished = state.outcome !== null || state.error !== null;
   useEffect(() => {
     if (finished) {
       socket.current?.markFinished();
@@ -211,5 +274,5 @@ export function useCaseRun(onStartOver?: () => void): {
 
   useEffect(() => stop, [stop]);
 
-  return { state, listen, start, listenTo, sendText, sendAudio, micLevel, stop };
+  return { state, listen, start, listenTo, sendText, sendAudio, micLevel, stop, away, stepAway, stepBack, answer };
 }

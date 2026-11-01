@@ -36,6 +36,11 @@ RANKING_WEIGHTS = RankingWeights()
 # Sub-score used when a field is missing ("unknown stays unknown").
 MISSING_SUBSCORE = 0.5
 
+# Every field Lana can ask on a call (agent/extractor.py CHECKLIST_ORDER), for DEMO_CHECKLIST.
+CHECKLIST_FIELDS = (
+    "total_price", "records_fee", "includes", "monthly_payment", "down_payment", "next_slots", "evening_hours",
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -83,13 +88,17 @@ class Settings(BaseSettings):
     public_base_url: str = ""
 
     # Demo usage limits (app/guard.py). TTS characters count only what is sent to ElevenLabs;
-    # STT seconds count all audio sent to Meta, including the silence sent while Lana talks.
+    # STT seconds count only real mic audio sent to Meta (no session is open while Lana talks).
     max_runs_per_case: int = Field(default=2, ge=1)
     max_cases_per_ip_hour: int = Field(default=5, ge=1)
     max_llm_calls_per_case: int = Field(default=60, ge=1)
     max_tts_chars_per_case: int = Field(default=4000, ge=0)
     max_tts_chars_per_day: int = Field(default=30000, ge=0)
-    max_stt_seconds_per_case: int = Field(default=180, ge=1)
+    max_stt_seconds_per_case: int = Field(default=300, ge=1)
+
+    # The checklist fields Lana asks on a call, comma-separated, in agent/extractor.py order.
+    # The extractor still fills any other field the clinic mentions.
+    demo_checklist: str = "total_price,records_fee,monthly_payment,next_slots"
 
     # Safety switches
     enable_real_calls: bool = False
@@ -106,6 +115,15 @@ class Settings(BaseSettings):
         ZoneInfo(v)
         return v
 
+    @field_validator("demo_checklist")
+    @classmethod
+    def _known_fields(cls, v: str) -> str:
+        names = [n.strip() for n in v.split(",") if n.strip()]
+        unknown = [n for n in names if n not in CHECKLIST_FIELDS]
+        if unknown or not names:
+            raise ValueError(f"DEMO_CHECKLIST needs names from {', '.join(CHECKLIST_FIELDS)}; got {v!r}")
+        return ",".join(names)
+
     @model_validator(mode="after")
     def _tts_models(self) -> "Settings":
         self.elevenlabs_model_agent = self.elevenlabs_model_agent or self.elevenlabs_model or "eleven_v4_turbo"
@@ -119,6 +137,10 @@ class Settings(BaseSettings):
     @cached_property
     def allowed_numbers(self) -> frozenset[str]:
         return frozenset(n.strip() for n in self.allowed_call_numbers.split(",") if n.strip())
+
+    @property
+    def demo_fields(self) -> frozenset[str]:
+        return frozenset(self.demo_checklist.split(","))
 
     def may_call(self, number: str) -> bool:
         """Real calls only when switched on and the number is on the allow list."""

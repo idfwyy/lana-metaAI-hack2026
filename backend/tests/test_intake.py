@@ -4,10 +4,12 @@ import pytest
 
 from app.agent import intake as intake_module
 from app.agent.intake import (
+    CITIES,
     DEFAULT_BUDGET,
     MAX_QUESTIONS,
     Intake,
     city_zip,
+    match_city,
     parse_budget,
 )
 from app.config import get_settings
@@ -104,16 +106,18 @@ def test_city_zip_table() -> None:
     assert city_zip("Fort Worth") == "76102"
     assert city_zip("plano, TX") == "75024"
     assert city_zip("Irving Texas") == "75039"
-    assert city_zip("Mansfield") == "76010"
+    assert city_zip("Mansfield") == "76063"
+    assert city_zip("Waco") == "76010"
+    assert len(CITIES) == 24
 
 
 async def test_unknown_city_keeps_text_and_default_zip(fake_json) -> None:
-    fake_json({"city": "Mansfield"})
+    fake_json({"city": "Waco"})
     intake = Intake()
 
-    await intake.hear("I'm in Mansfield")
+    await intake.hear("I'm in Waco")
 
-    assert intake.draft.city == "Mansfield"
+    assert intake.draft.city == "Waco"
     assert intake.to_preferences().zip_code == "76010"
     assert intake.to_preferences().max_distance_mi == 15
 
@@ -176,7 +180,7 @@ async def test_finishes_after_all_fields(fake_json) -> None:
     assert [t.done for t in turns] == [False] * 5 + [True]
     last = turns[-1]
     assert last.next_question is None
-    assert last.spoken == "Got it. Braces near Dallas, under $5,000, evening hours. I'll start calling now."
+    assert last.spoken == "Got it. Braces near Dallas, under $5,000, evening hours. I'm calling clinics now. You can watch, or step away and I'll call you back."
     assert "—" not in last.spoken
     prefs = intake.to_preferences()
     assert prefs.treatment == Treatment.BRACES
@@ -293,3 +297,72 @@ def test_no_em_dashes_in_lines() -> None:
     intake = Intake()
     for line in [intake.first_line(), *intake._lines.values()]:
         assert "—" not in line
+
+
+@pytest.mark.parametrize(
+    "said, expected",
+    [
+        ("LinkedIn", ("Arlington", "76010", True)),
+        ("fort worth", ("Fort Worth", "76102", False)),
+        ("near Plano, TX", ("Plano", "75024", False)),
+        ("grape vine", ("Grapevine", "76051", False)),
+        ("mckinny", ("McKinney", "75069", True)),
+        ("xyzzy", None),
+        ("blorptank", None),
+        ("color", None),
+        ("garden", None),
+        ("near me", None),
+    ],
+)
+def test_match_city(said, expected) -> None:
+    assert match_city(said) == expected
+
+
+async def test_misheard_city_is_matched_and_confirmed(fake_json) -> None:
+    fake_json({"treatment": "braces"}, {})  # the model finds no place in "LinkedIn"
+    intake = Intake()
+    await intake.hear("braces")
+    assert intake.current == "location"
+
+    turn = await intake.hear("LinkedIn")
+
+    assert intake.draft.city == "Arlington"
+    assert intake.draft.zip_code == "76010"
+    assert turn.spoken == f"Arlington, got it. {_question(intake, 'budget')}"
+
+
+async def test_model_city_is_fuzzy_matched_too(fake_json) -> None:
+    fake_json({"treatment": "braces", "city": "Linked In"})
+    intake = Intake()
+
+    turn = await intake.hear("braces near Linked In")
+
+    assert intake.draft.city == "Arlington"
+    assert turn.spoken.startswith("Arlington, got it. ")
+
+
+async def test_exact_city_needs_no_confirmation(fake_json) -> None:
+    fake_json({"treatment": "braces", "city": "fort worth"})
+    intake = Intake()
+
+    turn = await intake.hear("braces in fort worth")
+
+    assert intake.draft.city == "Fort Worth" and intake.draft.zip_code == "76102"
+    assert turn.spoken == _question(intake, "budget")
+
+
+async def test_two_unusable_answers_use_the_default_and_never_ask_a_third_time(fake_json) -> None:
+    fake_json({"treatment": "braces"}, {}, {})
+    intake = Intake()
+    await intake.hear("braces")
+    location = _question(intake, "location")
+    assert location == "Which city or ZIP code should I search near?"
+
+    second = await intake.hear("blorp")
+    assert second.spoken == location  # asked once more
+
+    third = await intake.hear("blorp blorp")
+    assert location not in third.spoken
+    assert third.spoken == f"{intake._lines['default_location']} {_question(intake, 'budget')}"
+    assert intake.current == "budget"
+    assert intake.to_preferences().zip_code == "76010"

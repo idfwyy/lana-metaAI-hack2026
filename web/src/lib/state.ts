@@ -47,6 +47,9 @@ export interface QuoteView {
   evidence: SourcedAnswer<unknown> | null;
 }
 
+/** How the callback ended: booked at a slot, or saved without booking. */
+export type Outcome = { kind: "booked"; clinicId: string; slot: string; totalSaved: number } | { kind: "saved" };
+
 export interface RunState {
   caseStatus: CaseStatus | null;
   order: string[];
@@ -58,6 +61,7 @@ export interface RunState {
   quotes: Record<string, QuoteView>;
   saved: number;
   offers: Offer[] | null;
+  outcome: Outcome | null;
   error: { message: string; code?: string } | null;
   firstAt: number | null;
 }
@@ -73,6 +77,7 @@ export const initialRun: RunState = {
   quotes: {},
   saved: 0,
   offers: null,
+  outcome: null,
   error: null,
   firstAt: null,
 };
@@ -108,7 +113,17 @@ export function runReducer(state: RunState, action: RunAction): RunState {
 
   switch (e.type) {
     case "case_status":
-      return { ...s, caseStatus: e.status };
+      return {
+        ...s,
+        caseStatus: e.status,
+        outcome: e.status === "saved" && !s.outcome ? { kind: "saved" } : s.outcome,
+      };
+
+    case "booked":
+      return {
+        ...s,
+        outcome: { kind: "booked", clinicId: e.clinic_id, slot: e.slot, totalSaved: e.total_saved },
+      };
 
     case "log_line": {
       const offset = firstAt !== null && !Number.isNaN(at) ? Math.max(0, (at - firstAt) / 1000) : 0;
@@ -203,18 +218,20 @@ export function runReducer(state: RunState, action: RunAction): RunState {
 
 // ---------- derived ----------
 
-/** Lowest confirmed all-in price; after ranking, the rank 1 offer. */
+/**
+ * Lowest confirmed all-in price; after ranking, the rank 1 offer.
+ * A price tie goes to the clinic Lana negotiated with: Python picks it as the best on
+ * everything but price, so at the same price the ranker puts it first. Then higher rating.
+ */
 export function leaderId(state: RunState): string | null {
   if (state.offers?.length) return state.offers[0].clinic.id;
-  let best: string | null = null;
-  let bestPrice = Infinity;
-  for (const q of Object.values(state.quotes)) {
-    if (q.price != null && q.price < bestPrice) {
-      bestPrice = q.price;
-      best = q.clinicId;
-    }
-  }
-  return best;
+  const priced = Object.values(state.quotes).filter((q) => q.price != null);
+  if (priced.length === 0) return null;
+  const lowest = Math.min(...priced.map((q) => q.price!));
+  const tied = priced.filter((q) => q.price === lowest);
+  const negotiated = tied.find((q) => q.drops.some((d) => d.concession !== null));
+  if (negotiated) return negotiated.clinicId;
+  return tied.reduce((a, b) => (clinicById(b.clinicId).rating > clinicById(a.clinicId).rating ? b : a)).clinicId;
 }
 
 function short(clinicId: string): string {
@@ -222,7 +239,11 @@ function short(clinicId: string): string {
 }
 
 export function statusLine(state: RunState): string {
-  if (state.offers && state.caseStatus === "offers_ready") return "Lana found your best offer";
+  if (state.outcome?.kind === "booked") return "Booked";
+  if (state.outcome?.kind === "saved") return "Quote saved";
+  if (state.offers && (state.caseStatus === "offers_ready" || state.caseStatus === "callback")) {
+    return "Lana found your best offer";
+  }
   const calls = Object.values(state.calls);
   const active = calls.find((c) => c.callId === state.currentCallId && c.phase !== "done" && c.phase !== "waiting");
   const held = calls.find((c) => c.phase === "on_hold");

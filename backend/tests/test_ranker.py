@@ -137,3 +137,15 @@ async def test_tradeoffs_never_change_order(monkeypatch: pytest.MonkeyPatch) -> 
     assert _ids(result) == before
     assert [o.rank for o in result] == [1, 2, 3]
     assert result[0].tradeoffs == [f"{before[0]} one", f"{before[0]} two"]
+
+
+def test_a_price_tie_goes_to_the_higher_score_not_the_first_id() -> None:
+    clinic = get_public_clinics()[0]
+    worse = clinic.model_copy(update={"id": "a", "rating": 3.5, "distance_mi": 9.0})
+    better = clinic.model_copy(update={"id": "b", "rating": 4.9, "distance_mi": 2.0})
+    quotes = [Quote(clinic_id=c.id, checklist=ClinicChecklist(), all_in_price=4200) for c in (worse, better)]
+
+    offers = rank_offers(quotes, [worse, better], _prefs(), now=NOW)
+
+    assert _ids(offers) == ["b", "a"]
+    assert offers[0].score > offers[1].score

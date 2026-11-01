@@ -405,3 +405,42 @@ async def test_opening_line_prepended_once_without_disclosure(monkeypatch: pytes
     assert receptionist.heard[0] == lana[0]
     assert sum("Thanks for holding." in line for line in lana) == 1
     assert not any("AI assistant" in line for line in lana)
+
+
+async def test_on_concession_runs_before_the_call_ends(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def phrase(move):
+        return move.template()
+
+    monkeypatch.setattr(negotiator, "phrase_move", phrase)
+    monkeypatch.setattr(
+        negotiator,
+        "call_json",
+        FakeJson(
+            _reading(Verdict.YES, new_all_in=4200, evidence="we can match $4,200"),
+            _reading(Verdict.YES, amount_off=100, evidence="$100 off"),
+            _reading(Verdict.NO, evidence="no extra retainers"),
+        ),
+    )
+    receptionist = FakeReceptionist(
+        "Good news, we can match $4,200.", "Sure, $100 off if paid in full.", "Sorry, no extra retainers."
+    )
+    timeline: list[tuple] = []
+
+    async def on_concession(concession, new_all_in):
+        timeline.append(("won", concession.label, new_all_in))
+
+    await negotiate(
+        _quotes()["parkway"],
+        _moves(),
+        receptionist,
+        lambda s, t, ts: timeline.append(("line", s, t)),
+        "c1",
+        on_concession=on_concession,
+    )
+
+    won = [i for i, item in enumerate(timeline) if item[0] == "won"]
+    assert [timeline[i][1:] for i in won] == [("Price match", 4200), ("Pay-in-full discount", 4100)]
+    # Each drop comes right after the clinic's yes, before Lana's next ask and her closing line.
+    assert timeline[won[0] - 1] == ("line", Speaker.CLINIC, "Good news, we can match $4,200.")
+    assert timeline[won[0] + 1][1] == Speaker.AGENT
+    assert timeline[-1] == ("line", Speaker.AGENT, CLOSING_LINE)

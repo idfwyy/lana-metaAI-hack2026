@@ -4,6 +4,7 @@ The model only pulls out what the patient said. Python merges it into the draft,
 next question from a fixed list in prompts/intake.md, and decides when intake is done.
 """
 
+import difflib
 import logging
 import re
 from pathlib import Path
@@ -22,15 +23,45 @@ PROMPT_SPLIT = "<!-- lines -->"
 
 MAX_QUESTIONS = 6
 
-# A city without a ZIP gets that city's default ZIP; anything else gets DEFAULT_ZIP.
-CITY_ZIPS = {
-    "dallas": "75201",
-    "fort worth": "76102",
-    "arlington": "76010",
-    "plano": "75024",
-    "irving": "75039",
+# The main DFW cities and a ZIP for each. A city without a ZIP gets its ZIP here; a place
+# that matches none of them gets DEFAULT_ZIP (Arlington).
+CITIES = {
+    "Dallas": "75201",
+    "Fort Worth": "76102",
+    "Arlington": "76010",
+    "Plano": "75024",
+    "Irving": "75039",
+    "Grand Prairie": "75050",
+    "Garland": "75040",
+    "Mesquite": "75149",
+    "Frisco": "75034",
+    "McKinney": "75069",
+    "Denton": "76201",
+    "Carrollton": "75006",
+    "Richardson": "75080",
+    "Lewisville": "75067",
+    "Mansfield": "76063",
+    "Euless": "76039",
+    "Bedford": "76021",
+    "Hurst": "76053",
+    "Grapevine": "76051",
+    "Southlake": "76092",
+    "Keller": "76248",
+    "Cedar Hill": "75104",
+    "Duncanville": "75116",
+    "DeSoto": "75115",
 }
+CITY_ZIPS = {name.lower(): zip_code for name, zip_code in CITIES.items()}
 DEFAULT_ZIP = "76010"
+
+# Fuzzy city matching, for speech-to-text slips such as "LinkedIn" for "Arlington".
+# A match needs close spelling, or a close sound with longer keys and some shared spelling,
+# so short words ("color", "garden") never turn into a city.
+SPELLING_CUTOFF = 0.8
+SOUND_CUTOFF = 0.85
+SOUND_MIN_SPELLING = 0.4
+SOUND_MIN_KEY = 4
+_SOUND_MAP = str.maketrans({"g": "k", "q": "k", "c": "k", "d": "t", "b": "p", "v": "f", "z": "s", "x": "s"})
 DEFAULT_DISTANCE_MI = 15.0
 # A skipped budget means no cap in practice; every demo clinic lists well under this.
 DEFAULT_BUDGET = 10_000
@@ -168,6 +199,51 @@ def city_zip(city: str) -> str:
     return CITY_ZIPS.get(name, DEFAULT_ZIP)
 
 
+def _sound(text: str) -> str:
+    """A rough sound key: similar consonants merged, vowels and h/w/y dropped, repeats collapsed."""
+    letters = re.sub(r"[^a-z]", "", text.lower()).translate(_SOUND_MAP)
+    return re.sub(r"(.)\1+", r"\1", re.sub(r"[aeiouyhw]", "", letters))
+
+
+def _ratio(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def match_city(text: str) -> tuple[str, str, bool] | None:
+    """The DFW city in `text` as (name, ZIP, fuzzy), or None.
+
+    An exact name (any case, spaces optional: "grape vine") wins. Otherwise the closest city
+    by spelling or by sound, if it clears the cutoffs; `fuzzy` is True then.
+    """
+    words = re.findall(r"[a-z]+", text.lower())
+    words = [w for w in words if w not in ("tx", "texas")]
+    grams = [" ".join(words[i : i + n]) for n in (2, 1) for i in range(len(words) - n + 1)]
+    squashed = {name.lower().replace(" ", ""): name for name in CITIES}
+    for gram in grams:
+        name = squashed.get(gram.replace(" ", ""))
+        if name is not None:
+            return name, CITIES[name], False
+
+    best: tuple[float, str] | None = None
+    for gram in grams:
+        gram_sound = _sound(gram)
+        for name in CITIES:
+            spelling = _ratio(gram, name.lower())
+            city_sound = _sound(name)
+            sound = _ratio(gram_sound, city_sound)
+            close = spelling >= SPELLING_CUTOFF or (
+                sound >= SOUND_CUTOFF
+                and spelling >= SOUND_MIN_SPELLING
+                and min(len(gram_sound), len(city_sound)) >= SOUND_MIN_KEY
+            )
+            score = max(spelling, sound)
+            if close and (best is None or score > best[0]):
+                best = (score, name)
+    if best is None:
+        return None
+    return best[1], CITIES[best[1]], True
+
+
 def _clean_zip(value: str | None) -> str | None:
     if not value:
         return None
@@ -191,7 +267,10 @@ class Intake:
         self.asked = 0
         self.current: str | None = None  # the topic Lana asked last; None before the first question
         self.skipped: set[str] = set()
+        # Replies that left a topic unanswered. The second one sets its default: never a third ask.
+        self.misses: dict[str, int] = dict.fromkeys(TOPIC_FIELDS, 0)
         self.done = False
+        self._fuzzy_city: str | None = None  # a city fuzzy-matched from this reply, for Lana to confirm
         self._prompt, self._lines = _prompts()
 
     def first_line(self) -> str:
@@ -230,16 +309,21 @@ class Intake:
         heard = await call_json(prompt, _Heard, settings.model_fast, reasoning=settings.call_reasoning)
 
         medical = heard.medical_question or bool(_MEDICAL_RE.search(lowered))
+        self._fuzzy_city = None
         filled = self._merge(heard, lowered, medical)
 
         current = self.current
-        if (
-            not medical
-            and current is not None
-            and not self.is_answered(current)
-            and (heard.skip or _SKIP_RE.search(lowered))
-        ):
-            self.skipped.add(current)
+        default = ""
+        if current is not None and not self.is_answered(current):
+            if not medical and (heard.skip or _SKIP_RE.search(lowered)):
+                self.skipped.add(current)
+            else:
+                self.misses[current] += 1
+                if self.misses[current] >= 2:
+                    # Asked twice with no usable answer: use the default, say so, move on.
+                    self.skipped.add(current)
+                    default = self._lines[f"default_{current}"] + " "
+                    log.info("intake used the default for %s after two unusable answers", current)
 
         topic = self._next_topic()
         # A question repeated after the no-advice line is the same question, not a new one.
@@ -254,9 +338,12 @@ class Intake:
         lead = self._lines["no_advice"] + " " if medical else ""
         if topic is None:
             self.done = True
-            return IntakeTurn(filled=filled, done=True, spoken=lead + self._confirmation())
+            # The confirmation names the place, so a fuzzy city needs no separate check.
+            return IntakeTurn(filled=filled, done=True, spoken=lead + default + self._confirmation())
+        if self._fuzzy_city:
+            lead += self._lines["fuzzy_city"].format(city=self._fuzzy_city) + " "
         next_question = self._lines[topic]
-        return IntakeTurn(filled=filled, next_question=next_question, spoken=lead + next_question)
+        return IntakeTurn(filled=filled, next_question=next_question, spoken=lead + default + next_question)
 
     def _merge(self, heard: _Heard, text: str, medical: bool) -> list[str]:
         """Write what the patient said into the draft. A later answer replaces an earlier one."""
@@ -267,10 +354,21 @@ class Intake:
 
         zip_code = _clean_zip(heard.zip_code)
         city = heard.city.strip() if heard.city and heard.city.strip() else None
+        known = match_city(city) if city is not None else None
+        if known is None and city is None and zip_code is None and self.current == "location":
+            # The model found no place, but the reply may hold a misheard city ("LinkedIn").
+            known = match_city(text)
+        if known is not None:
+            city = known[0]
+            if known[2]:
+                self._fuzzy_city = city
+                log.info("intake fuzzy-matched %r to %s", heard.city or text, city)
         if zip_code is not None:
             updates["zip_code"] = zip_code
             if city is None:
                 self.draft.city = None
+        elif known is not None:
+            updates["zip_code"] = known[1]
         elif city is not None:
             updates["zip_code"] = city_zip(city)
         if city is not None:
