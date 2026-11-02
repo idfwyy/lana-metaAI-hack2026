@@ -89,6 +89,10 @@ class Settings(BaseSettings):
 
     # Turn taking: after Meta ends a turn, wait this long in case the patient keeps talking.
     end_grace_ms: int = Field(default=700, ge=0, le=5000)
+    # Be the clinic: seconds of silence before Lana says "Sorry, I didn't catch that." (a second
+    # silence ends the call), and how long she waits for the judge to answer her hold request.
+    judge_silence_s: float = Field(default=12, gt=0)
+    judge_hold_s: float = Field(default=8, gt=0)
 
     # App
     database_url: str = "sqlite:///./data/dev.db"

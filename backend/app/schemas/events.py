@@ -65,6 +65,8 @@ class TranscriptFinal(_Event):
     speaker: Speaker
     text: str
     t_seconds: float = Field(ge=0)
+    # Be the clinic: the judge's own words on their call. Shown, never voiced.
+    judge: bool = False
 
 
 class QuoteUpdated(_Event):
@@ -96,6 +98,25 @@ class Booked(_Event):
     total_saved: int = Field(ge=0)
 
 
+JudgePhase = Literal["greeting", "price", "fees", "monthly", "opening", "hold", "negotiation", "wrap"]
+
+
+class JudgeTurnStart(_Event):
+    """Be the clinic: the judge should speak now. `wrap` is only a hint; nobody waits for it."""
+
+    type: Literal["judge_turn_start"] = "judge_turn_start"
+    clinic_id: str
+    phase: JudgePhase
+
+
+class JudgeHold(_Event):
+    """Be the clinic: the judge's call went on hold (True) or Lana came back (False)."""
+
+    type: Literal["judge_hold"] = "judge_hold"
+    clinic_id: str
+    on_hold: bool
+
+
 class ErrorEvent(_Event):
     type: Literal["error"] = "error"
     message: str
@@ -116,6 +137,8 @@ Event = Annotated[
     | OffersReady
     | CallbackStarted
     | Booked
+    | JudgeTurnStart
+    | JudgeHold
     | ErrorEvent,
     Field(discriminator="type"),
 ]

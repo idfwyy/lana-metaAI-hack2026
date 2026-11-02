@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { ArrowUp } from "lucide-react";
 import { DemoFooter } from "../components/DemoFooter";
 import { FlashCard, phrasesFor } from "../components/FlashCard";
+import { JudgeScriptCard } from "../components/JudgeScriptCard";
 import { LiveCaptions } from "../components/LiveCaptions";
 import { MicButton } from "../components/MicButton";
 import { PreferenceChips } from "../components/PreferenceChips";
@@ -16,6 +17,8 @@ interface Props {
   onMic: () => void;
   /** "or just show me": a Watch case, no mic needed. */
   onStart: () => void;
+  /** "or be the clinic": the viewer plays Parkway's front desk. */
+  onClinic: () => void;
   listen: ListenState;
   /** Lana's latest line to the patient. */
   lana: Line | null;
@@ -33,8 +36,10 @@ const leave = {
   transition: { duration: 0.16, ease: EASE_OUT },
 };
 
-export function Home({ busy, onMic, onStart, listen, lana, onSay, micLevel, voice, setVoice, clinics, setClinics }: Props) {
+export function Home({ busy, onMic, onStart, onClinic, listen, lana, onSay, micLevel, voice, setVoice, clinics, setClinics }: Props) {
   const active = listen.active;
+  // Be the clinic's briefing: Lana explains the role, the card shows the prices, the judge says ready.
+  const briefing = active && listen.clinic;
   const listening = active && listen.mic === "on" && !listen.lanaSpeaking && !listen.thinking;
 
   return (
@@ -78,6 +83,19 @@ export function Home({ busy, onMic, onStart, listen, lana, onSay, micLevel, voic
             />
           )}
 
+          {briefing && (
+            <motion.div key="briefing" {...rise(0.04, 6, 0.22)} className="flex w-full flex-col items-center gap-4">
+              <JudgeScriptCard compact />
+              <button
+                type="button"
+                onClick={() => onSay("Ready")}
+                className="pressable rounded-full bg-primary px-6 py-3 text-[15px] font-medium text-white hover:bg-primary-press"
+              >
+                Ready
+              </button>
+            </motion.div>
+          )}
+
           <AnimatePresence initial={false}>
             {listen.done && listen.preferences && (
               <motion.div key="ready" {...rise(0, 6, 0.2)} className="flex flex-col items-center gap-3">
@@ -92,11 +110,11 @@ export function Home({ busy, onMic, onStart, listen, lana, onSay, micLevel, voic
           </AnimatePresence>
 
           {/* Watch mode: the demo patient does the talking, so there is nothing to say or tap. */}
-          {!listen.demo && (
+          {!listen.demo && !briefing && (
             <FlashCard phrases={phrasesFor(listen)} onPick={active && listen.fallback ? onSay : undefined} />
           )}
 
-          {active && listen.fallback && <TypeBox onSay={onSay} />}
+          {active && listen.fallback && <TypeBox onSay={onSay} placeholder={briefing ? "Type ready to start" : undefined} />}
 
           {!active && (
             <button
@@ -106,6 +124,16 @@ export function Home({ busy, onMic, onStart, listen, lana, onSay, micLevel, voic
               className="pressable rounded-md text-[14px] text-muted underline decoration-hairline underline-offset-4 hover:text-ink hover:decoration-muted disabled:opacity-60"
             >
               or just show me
+            </button>
+          )}
+          {!active && (
+            <button
+              type="button"
+              onClick={onClinic}
+              disabled={busy}
+              className="pressable -mt-2 rounded-md text-[14px] text-muted underline decoration-hairline underline-offset-4 hover:text-ink hover:decoration-muted disabled:opacity-60"
+            >
+              or be the clinic
             </button>
           )}
         </motion.div>
@@ -119,7 +147,7 @@ export function Home({ busy, onMic, onStart, listen, lana, onSay, micLevel, voic
 }
 
 /** The no-mic fallback: anything typed here takes the same path as speech. */
-function TypeBox({ onSay }: { onSay: (text: string) => void }) {
+export function TypeBox({ onSay, placeholder = "Type what you need" }: { onSay: (text: string) => void; placeholder?: string }) {
   const [text, setText] = useState("");
 
   function submit(e: FormEvent) {
@@ -138,8 +166,8 @@ function TypeBox({ onSay }: { onSay: (text: string) => void }) {
       <input
         value={text}
         onChange={(e) => setText(e.target.value)}
-        placeholder="Type what you need"
-        aria-label="Type what you need"
+        placeholder={placeholder}
+        aria-label={placeholder}
         className="min-w-0 flex-1 bg-transparent text-[15px] text-ink outline-none placeholder:text-muted"
       />
       <button

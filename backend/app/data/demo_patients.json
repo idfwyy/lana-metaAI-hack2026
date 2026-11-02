@@ -65,5 +65,20 @@
       "budget_max": 6000,
       "prefers_monthly": true
     }
+  },
+  {
+    "id": "be_the_clinic",
+    "mode": "clinic",
+    "request": "I need braces near Arlington, under five thousand, with evening hours. I can pay in full if it's cheaper.",
+    "answers": {},
+    "preferences": {
+      "treatment": "braces",
+      "zip_code": "76010",
+      "max_distance_mi": 15,
+      "budget_max": 5000,
+      "pay_in_full_ok": true,
+      "must_haves": ["evening hours"],
+      "time_pref": "evening"
+    }
   }
 ]

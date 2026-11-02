@@ -34,6 +34,8 @@ export interface PlayerHandlers {
    * talk over her (barge-in); otherwise it is a clinic call and the mic stays muted.
    */
   speaking?: (on: boolean, toPatient: boolean) => void;
+  /** Be the clinic: Lana's lines on this call are to the judge, who may talk over her too. */
+  bargeable?: (callId: string) => boolean;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -170,7 +172,9 @@ export class Player {
 
   private async playOne(line: LineEvent, gen: number): Promise<void> {
     const lana = line.type === "agent_said" || (line.type === "transcript_final" && line.speaker === "agent");
-    const toPatient = line.type === "agent_said" && line.call_id === null;
+    const toPatient =
+      (line.type === "agent_said" && line.call_id === null) ||
+      (lana && line.type === "transcript_final" && line.call_id !== null && !!this.handlers.bargeable?.(line.call_id));
     if (toPatient) this.toPatient = line.seq!;
     if (lana) this.handlers.speaking?.(true, toPatient);
     try {

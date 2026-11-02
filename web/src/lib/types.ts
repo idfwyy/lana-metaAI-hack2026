@@ -134,6 +134,8 @@ export interface TranscriptFinal extends Base {
   speaker: Speaker;
   text: string;
   t_seconds: number;
+  /** Be the clinic: the judge's own words. Shown at once, never voiced. */
+  judge?: boolean;
 }
 export interface QuoteUpdated extends Base {
   type: "quote_updated";
@@ -158,6 +160,20 @@ export interface Booked extends Base {
   clinic_id: string;
   slot: string;
   total_saved: number;
+}
+/** Be the clinic: what Lana asked about, so the card can suggest lines. `wrap` is only a hint. */
+export type JudgePhase = "greeting" | "price" | "fees" | "monthly" | "opening" | "hold" | "negotiation" | "wrap";
+/** Be the clinic: the judge should speak now. */
+export interface JudgeTurnStart extends Base {
+  type: "judge_turn_start";
+  clinic_id: string;
+  phase: JudgePhase;
+}
+/** Be the clinic: the judge's call went on hold, or Lana came back. */
+export interface JudgeHold extends Base {
+  type: "judge_hold";
+  clinic_id: string;
+  on_hold: boolean;
 }
 /** Orchestrator errors carry step/recoverable; socket-level errors (main.py) carry code. */
 export interface ErrorEvent extends Base {
@@ -214,10 +230,10 @@ export interface IntakeUpdate extends Base {
   draft: PreferencesDraft;
   preferences?: Preferences;
 }
-/** A spoken command the browser acts on itself: start over, or step away while the calls run. */
+/** A spoken command the browser acts on itself: start over, step away while the calls run, or be the clinic. */
 export interface CommandEvent extends Base {
   type: "command";
-  name: "start_over" | "step_away" | string;
+  name: "start_over" | "step_away" | "clinic" | string;
 }
 
 /** audio_bus: frames for one line, pointing back to it with line_seq. */
@@ -245,6 +261,8 @@ export type ServerEvent =
   | OffersReady
   | CallbackStarted
   | Booked
+  | JudgeTurnStart
+  | JudgeHold
   | ErrorEvent
   | UserPartial
   | SttUnavailable
@@ -258,7 +276,8 @@ export type LineEvent = AgentSaid | TranscriptFinal | UserSaid;
 export function isLine(m: ServerMessage): m is LineEvent {
   return (
     m.type === "agent_said" ||
-    (m.type === "transcript_final" && (m.speaker === "agent" || m.speaker === "clinic")) ||
+    // The judge's own lines have no audio to wait for.
+    (m.type === "transcript_final" && !m.judge && (m.speaker === "agent" || m.speaker === "clinic")) ||
     (m.type === "user_said" && m.voiced === true)
   );
 }

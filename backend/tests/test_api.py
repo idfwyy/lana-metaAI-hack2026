@@ -17,10 +17,10 @@ from app.agent.ranker import rank_offers
 from app.agent.researcher import pick_clinics
 from app.cli import DEMO_PREFERENCES
 from app.config import get_settings
-from app.data.loader import get_public_clinics
+from app.data.loader import get_public_clinics, load_demo_clinics
 from app.db.store import store
 from app.integrations import meta_llm
-from app.schemas.enums import CallStatus, CaseStatus, Speaker
+from app.schemas.enums import CallStatus, CaseStatus, DemoMode, Speaker
 from app.schemas.events import Booked, CallbackStarted, CallStatusEvent, CaseStatusEvent, LogLine, TranscriptFinal
 from app.schemas.quote import Quote
 from app.voice import audio_bus, tts
@@ -32,6 +32,7 @@ CLINIC_LINE = "Thanks for calling Parkway, how can I help?"
 
 QUOTES = Path(__file__).parent / "fixtures" / "transcripts" / "three_quotes.json"
 SUMMARY = "Parkway Orthodontics came in at $5,050 all in."
+PRICE_QUESTION = "How much is the full treatment at your office?"
 
 LOUD = (8000).to_bytes(2, "little", signed=True) * (AUDIO_FORMAT.chunk_bytes(CHUNK_MS) // 2)
 
@@ -76,6 +77,7 @@ class World:
         self.callback_budget = 10_000  # the budget the fake callback ranks its offers against
         self.orchestrators: list = []
         self.booked_any_time: list[bool] = []  # book()'s any_time, per booking
+        self.judges: list = []  # Be the clinic: each JudgeLine the factory built
 
 
 class FakeSTT:
@@ -116,8 +118,9 @@ def world(monkeypatch) -> World:
     w = World()
 
     class FakeOrchestrator:
-        def __init__(self, case, emit, max_clinics=3) -> None:
+        def __init__(self, case, emit, max_clinics=3, receptionists=None) -> None:
             self.case, self.emit = case, emit
+            self.receptionists = receptionists
             self.summary = None
             self.stepped_away = False
             w.orchestrators.append(self)
@@ -152,6 +155,8 @@ def world(monkeypatch) -> World:
 
         async def run(self):
             w.runs += 1
+            if self.receptionists is not None:
+                return await clinic_run(self)
             try:
                 for event in w.script(self.case.id):
                     await self.emit(event)
@@ -163,6 +168,32 @@ def world(monkeypatch) -> World:
                 raise
             self.case.status = CaseStatus.OFFERS_READY
             return self.case
+
+    async def clinic_run(orch):
+        """Be the clinic, cut short: the judge picks up, Lana asks the price, the call ends."""
+        clinic, sheet = next(pair for pair in load_demo_clinics() if pair[0].id == "parkway")
+        case_id, call_id = orch.case.id, "parkway-judge1"
+
+        async def line(speaker, text):
+            await orch.emit(TranscriptFinal(case_id=case_id, call_id=call_id, speaker=speaker, text=text, t_seconds=0))
+
+        async def say(text):
+            await line(Speaker.AGENT, text)
+
+        judge = orch.receptionists(clinic, sheet, say)
+        w.judges.append(judge)
+        for status in (CallStatus.DIALING, CallStatus.LIVE):
+            await orch.emit(CallStatusEvent(case_id=case_id, call_id=call_id, clinic_id="parkway", status=status))
+        greeting = await judge.answer()
+        if greeting:
+            await line(Speaker.CLINIC, greeting)
+        await say(PRICE_QUESTION)
+        reply = await judge.next_line(PRICE_QUESTION)
+        await line(Speaker.CLINIC, reply)
+        await orch.emit(CallStatusEvent(case_id=case_id, call_id=call_id, clinic_id="parkway", status=CallStatus.ENDED))
+        orch.case.status = CaseStatus.OFFERS_READY
+        await orch.emit(CaseStatusEvent(case_id=case_id, status=CaseStatus.OFFERS_READY, previous=CaseStatus.NEGOTIATING))
+        return orch.case
 
     async def fake_speech(text, voice_id, *, speaker, model=None, stability=None):
         w.spoken.append((text, voice_id, speaker))
@@ -279,10 +310,13 @@ def test_post_cases_returns_an_id(client) -> None:
     assert record is not None and record.voice is False and record.clinics == 3
 
 
-def test_clinic_mode_is_not_built_yet(client) -> None:
-    response = client.post("/cases", json={"mode": "clinic"})
-    assert response.status_code == 501
-    assert "not built yet" in response.json()["detail"]
+def test_a_clinic_case_has_two_clinics_and_the_clinic_patient(client) -> None:
+    case_id = _new_case(client, mode="clinic", clinics=3)
+    record = store.get(case_id)
+    assert record.clinics == 2
+    assert record.case.mode == DemoMode.BE_THE_CLINIC
+    assert record.case.preferences == main.clinic_patient().preferences
+    assert main.clinic_patient().id not in [p.id for p in main.load_demo_patients()]  # never a Watch patient
 
 
 def test_patient_case_starts_without_preferences(client) -> None:
@@ -648,14 +682,20 @@ def test_saying_just_show_me_starts_the_watch_run(client, world) -> None:
     assert world.classified == []  # a keyword matched; no LLM
 
 
-def test_clinic_mode_is_coming_soon_and_start_over_resets(client, world) -> None:
+def test_saying_be_the_clinic_tells_the_browser_to_start_clinic_mode(client, world) -> None:
     with _listen(client) as ws:
         _greeted(ws)
-        ws.send_json({"type": "user_text", "text": "I'll be the clinic"})
-        said = _until(ws, lambda m: m["type"] == "agent_said")
+        ws.send_json({"type": "user_text", "text": "Let me be the clinic"})
+        messages = _until(ws, lambda m: m["type"] == "command")
+    assert messages[-1]["name"] == "clinic"
+    assert world.runs == 0
+
+
+def test_start_over_resets(client, world) -> None:
+    with _listen(client) as ws:
+        _greeted(ws)
         ws.send_json({"type": "user_text", "text": "Start over"})
         reset = _until(ws, lambda m: m["type"] == "command")
-    assert said[-1]["text"] == main.COMING_SOON
     assert reset[-1]["name"] == "start_over"
     assert world.runs == 0
 
@@ -1069,3 +1109,85 @@ def test_stepping_away_during_the_calls_is_told_to_the_orchestrator(client, worl
         assert world.orchestrators[-1].stepped_away is False
         ws.send_json({"type": "command", "name": "step_away"})
         _wait_for(lambda: world.orchestrators[-1].stepped_away)
+
+
+# ---------- Be the clinic ----------
+
+
+def _clinic(client: TestClient):
+    return client.websocket_connect(f"/ws/case/{_new_case(client, mode='clinic')}")
+
+
+def _briefed(ws) -> list[dict]:
+    ws.send_json({"type": "listen"})
+    messages = _until(ws, lambda m: m["type"] == "audio" and m["last"])
+    time.sleep(0.05)
+    return messages
+
+
+def _turn(ws, phase: str) -> list[dict]:
+    return _until(ws, lambda m: m["type"] == "judge_turn_start" and m["phase"] == phase)
+
+
+def test_clinic_mode_starts_with_the_briefing_and_waits_for_ready(client, world) -> None:
+    with _clinic(client) as ws:
+        said = _briefed(ws)
+        ws.send_json({"type": "user_text", "text": "What do I do?"})
+        nudge = _until(ws, lambda m: m["type"] == "agent_said")
+        assert world.runs == 0
+        ws.send_json({"type": "user_text", "text": "Ready"})
+        _turn(ws, "greeting")
+    assert said[0]["type"] == "agent_said" and said[0]["text"] == main.BRIEFING
+    assert nudge[-1]["text"] == main.READY_AGAIN
+    assert world.runs == 1 and world.max_clinics == [2]
+    assert world.preferences[-1] == main.clinic_patient().preferences
+
+
+def test_clinic_mode_turns_typed_replies_into_the_judges_lines(client, world) -> None:
+    with _clinic(client) as ws:
+        _briefed(ws)
+        ws.send_json({"type": "user_text", "text": "Yes"})
+        _turn(ws, "greeting")
+        ws.send_json({"type": "user_text", "text": "Parkway Orthodontics, how can I help?"})
+        first = _turn(ws, "price")
+        ws.send_json({"type": "user_text", "text": "It's $4,800 plus a $250 records fee."})
+        messages = _until(ws, lambda m: m["type"] == "judge_turn_start" and m["phase"] == "wrap")
+        messages += _until(ws, lambda m: m["type"] == "case_status" and m["status"] == "offers_ready")
+    messages = first + messages
+    judge = [m for m in messages if m["type"] == "transcript_final" and m.get("judge")]
+    assert [m["text"] for m in judge] == ["Parkway Orthodontics, how can I help?", "It's $4,800 plus a $250 records fee."]
+    assert all(m["speaker"] == "clinic" for m in judge)
+    assert not any(_audio(messages, m["seq"]) for m in judge)  # the judge's own words are never voiced
+    assert not any(m["type"] == "user_said" for m in messages)
+    phases = [m["phase"] for m in messages if m["type"] == "judge_turn_start"]
+    assert phases == ["price", "wrap"]  # the wrap hint follows the end of the call
+    assert not any(m["type"] == "callback_started" for m in messages)
+    time.sleep(0.1)
+    assert world.orchestrators[-1].summary is None  # no callback in clinic mode
+
+
+def test_barge_in_works_on_lanas_line_to_the_judge(client, world) -> None:
+    with _clinic(client) as ws:
+        _briefed(ws)
+        ws.send_json({"type": "user_text", "text": "Ready"})
+        _turn(ws, "greeting")
+        world.chunks = [b"a" * 10] * 20
+        world.chunk_delay = 0.05  # her price question takes about a second to send
+        ws.send_json({"type": "user_text", "text": "Parkway, hi!"})
+        question = _until(ws, lambda m: m["type"] == "transcript_final" and m["speaker"] == "agent")[-1]
+        ws.receive_json()  # her first audio frame
+        ws.send_json({"type": "barge_in"})
+        frames = _until(ws, lambda m: m["type"] == "audio" and m["last"])
+        ws.send_json({"type": "user_text", "text": "It's $4,800 all in."})
+        messages = _until(ws, lambda m: m["type"] == "transcript_final" and m.get("judge") and "4,800" in m["text"])
+    assert frames[-1]["line_seq"] == question["seq"] and frames[-1].get("cut") is True
+    assert len(frames) < len(world.chunks)
+    assert messages[-1]["text"] == "It's $4,800 all in."
+
+
+def test_a_clinic_case_does_not_open_with_start(client, world) -> None:
+    with _clinic(client) as ws:
+        ws.send_json({"type": "start"})
+        msg = ws.receive_json()
+    assert msg["type"] == "error" and msg["code"] == "bad_message"
+    assert world.runs == 0

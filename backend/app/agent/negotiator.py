@@ -15,7 +15,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from app.agent.caller import DISCLOSURE, WORDS_PER_SECOND, OnLine, Receptionist
+from app.agent.caller import DISCLOSURE, WORDS_PER_SECOND, CallEnded, OnLine, Receptionist
 from app.agent.extractor import find_evidence
 from app.agent.ranker import passes_filters, sub_scores, weighted
 from app.clinics.simulator import dollar_amounts
@@ -367,6 +367,9 @@ async def negotiate(
 ) -> NegotiationResult:
     """Ask each move once (at most 4 asks). A no ends that move; the next one is tried.
 
+    If the receptionist hangs up (CallEnded), no more moves are asked and Lana has already
+    said goodbye; the result keeps what was won.
+
     `opening_line` (e.g. "Thanks for holding.") goes in front of Lana's first line, after the
     disclosure. `start_t` continues a call's clock, so evidence seconds match that call.
     `on_concession` runs as soon as each concession is won, before the next ask.
@@ -392,19 +395,30 @@ async def negotiate(
             line = f"{DISCLOSURE.format(agent_name=get_settings().agent_name)} {line}"
         asks += 1
 
-        reply, t = await call.exchange(line)
-        reading = await _read_safely(move, reply)
-        answered_source = waited = False
-        while True:
-            if reading.verdict == Verdict.ASKS_WHICH_CLINIC and move.cited_clinic and not answered_source:
-                answered_source = True
-                reply, t = await call.exchange(SOURCE_LINE.format(**move.model_dump()))
-            elif reading.verdict == Verdict.PENDING and not waited:
-                waited = True
-                reply, t = await call.exchange(WAIT_LINE)
-            else:
-                break
+        try:
+            reply, t = await call.exchange(line)
             reading = await _read_safely(move, reply)
+            answered_source = waited = False
+            while True:
+                if reading.verdict == Verdict.ASKS_WHICH_CLINIC and move.cited_clinic and not answered_source:
+                    answered_source = True
+                    reply, t = await call.exchange(SOURCE_LINE.format(**move.model_dump()))
+                elif reading.verdict == Verdict.PENDING and not waited:
+                    waited = True
+                    reply, t = await call.exchange(WAIT_LINE)
+                else:
+                    break
+                reading = await _read_safely(move, reply)
+        except CallEnded as err:
+            # The move got no answer, so it is neither won nor refused.
+            log.info("negotiator: the clinic ended the call: %s", err)
+            return NegotiationResult(
+                clinic_id=target_quote.clinic_id,
+                first_all_in=first,
+                final_all_in=current,
+                concessions=concessions,
+                refused=refused,
+            )
 
         concession = concession_from(move, reading, reply, t, call_id)
         if concession is None:

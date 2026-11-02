@@ -9,6 +9,10 @@ nothing during her lines (its session closes and reopens on the patient's next f
 Watch mode opens the same way, with a demo patient (data/demo_patients.json) in place of the
 mic: their request is voiced, Lana answers it with her real intake, and the calls start with
 the preferences she heard.
+
+Be the clinic opens with listen too: Lana briefs the judge, and on "ready" the calls start for
+the clinic-mode demo patient. The judge's mic is Parkway's front desk (clinics/judge_line.py);
+the other clinic is simulated. Their own words are shown, never voiced, and there is no callback.
 """
 
 import asyncio
@@ -29,18 +33,28 @@ from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from app import guard
 from app.agent.commands import Command as SpokenCommand
-from app.agent.commands import parse_command
+from app.agent.commands import match_command, parse_command
 from app.agent.caller import opening_lines
 from app.agent.intake import TOPIC_FIELDS, Intake
-from app.agent.orchestrator import Orchestrator, pick_slot, spoken_slot
+from app.agent.orchestrator import Orchestrator, Say, pick_slot, simulated, spoken_slot
 from app.cli import DEMO_PREFERENCES
+from app.clinics.judge_line import CALL_BACK_LATER, DIDNT_CATCH, JUDGE_CLINIC_ID, JudgeLine
 from app.config import get_settings
 from app.data.loader import get_public_clinics
 from app.db.store import CaseRecord, store
 from app.integrations import meta_llm
 from app.schemas.case import Case
-from app.schemas.enums import CaseStatus, DemoMode, Speaker
-from app.schemas.events import AgentSaid, UserSaid
+from app.schemas.clinic import Clinic, PriceSheet
+from app.schemas.enums import CallStatus, CaseStatus, DemoMode, Speaker
+from app.schemas.events import (
+    AgentSaid,
+    CallStatusEvent,
+    JudgeHold,
+    JudgePhase,
+    JudgeTurnStart,
+    TranscriptFinal,
+    UserSaid,
+)
 from app.schemas.preferences import TIME_PLURAL, Preferences
 from app.voice import tts
 from app.voice.audio_bus import AudioBus
@@ -58,7 +72,6 @@ GREETING = (
     "Hey, I'm {agent_name}, your personal health companion! Quick heads-up, this is a live demo, "
     "so I'll call demo clinics, not real offices. What do you need help with?"
 )
-COMING_SOON = "That mode is coming soon."
 SORRY = "Sorry, I missed that. Could you say it again?"
 # The callback, after Lana's summary.
 BOOK_QUESTION = "Want me to book it?"
@@ -73,7 +86,16 @@ NO_MATCH_QUESTION = "They don't have {times}. The earliest is {slot}. Want that,
 # cover, and her line if intake fails (the scenario's own preferences are used then).
 DEMO_DONE_LINE = "That's it, go ahead."
 DEMO_FALLBACK_CONFIRM = "Got it. I'm calling clinics now. You can watch, or step away and I'll call you back."
-FIXED_LINES = [COMING_SOON, SORRY, BOOK_AGAIN, SAVED_LINE, NO_SLOT_LINE, DEMO_FALLBACK_CONFIRM]
+# Be the clinic: Lana's briefing on Home, and her nudge when the judge says something other than ready.
+BRIEFING = (
+    "Great. You're the front desk at Parkway Orthodontics. I'm calling for a patient who wants braces "
+    "near Arlington with evening hours. Answer however you like, the card shows your prices. Ready?"
+)
+READY_AGAIN = "Just say ready when you want me to call."
+FIXED_LINES = [
+    SORRY, BOOK_AGAIN, SAVED_LINE, NO_SLOT_LINE, DEMO_FALLBACK_CONFIRM,
+    BRIEFING, READY_AGAIN, DIDNT_CATCH, CALL_BACK_LATER,
+]
 # A partial during the grace period means the patient is talking again; if Meta never sends
 # that utterance's final, the turn is committed this long after the partial anyway.
 GRACE_PARTIAL_EXTRA_S = 3.0
@@ -82,21 +104,34 @@ DEMO_PATIENTS_PATH = Path(__file__).resolve().parent / "data" / "demo_patients.j
 
 
 class DemoPatient(BaseModel):
-    """One Watch mode scenario: what the patient asks, what they answer if Lana asks more."""
+    """One demo scenario: what the patient asks, what they answer if Lana asks more."""
 
     id: str
+    # watch: a Watch mode patient. clinic: the patient Lana calls for in Be the clinic.
+    mode: Literal["watch", "clinic"] = "watch"
     request: str
     answers: dict[str, str] = Field(default_factory=dict, description="Keyed by intake topic")
-    preferences: Preferences = Field(description="Used if intake fails")
+    preferences: Preferences = Field(description="Used if intake fails; Be the clinic always uses them")
 
 
-def load_demo_patients() -> list[DemoPatient]:
-    return TypeAdapter(list[DemoPatient]).validate_json(DEMO_PATIENTS_PATH.read_bytes())
+def load_demo_patients(mode: Literal["watch", "clinic"] = "watch") -> list[DemoPatient]:
+    patients = TypeAdapter(list[DemoPatient]).validate_json(DEMO_PATIENTS_PATH.read_bytes())
+    return [p for p in patients if p.mode == mode]
+
+
+def clinic_patient() -> DemoPatient:
+    """Be the clinic's fixed patient: their preferences make Parkway the first call."""
+    return load_demo_patients("clinic")[0]
 
 # What the patient says to step away while the calls run (after _normalize).
 STEP_AWAY_PHRASES = {
     "i'll wait", "i will wait", "i'll just wait", "i can wait", "step away", "i'll step away",
     "call me back", "just call me back", "call me when it's done", "call me when you're done",
+}
+# What the judge says to start the call in Be the clinic (after _normalize); a plain yes works too.
+READY_PHRASES = {
+    "ready", "i'm ready", "im ready", "i am ready", "ready let's go", "let's go", "lets go", "go",
+    "ok", "okay", "let's do it", "call", "call them", "call me", "start", "start the call",
 }
 
 
@@ -209,19 +244,19 @@ class CreateCase(BaseModel):
 
 @app.post("/cases")
 async def create_case(body: CreateCase, request: Request):
-    if body.mode == "clinic":
-        return JSONResponse(
-            status_code=501,
-            content={"detail": f"Mode '{body.mode}' is not built yet. Watch and patient run in this build."},
-        )
     ip = request.client.host if request.client else "unknown"
     if not guard.allow_new_case(ip):
         return JSONResponse(status_code=429, content={"code": "limit", "message": guard.LIMIT_MESSAGE})
-    # A patient case has no preferences until intake fills them.
-    preferences = DEMO_PREFERENCES if body.mode == "watch" else None
-    case = Case(preferences=preferences, mode=DemoMode.WATCH)
-    store.create(case, voice=body.voice, clinics=body.clinics)
-    log.info("case=%s created (%s, voice %s, %d clinics)", case.id, body.mode, body.voice, body.clinics)
+    clinics: int = body.clinics
+    if body.mode == "clinic":
+        # Two calls: Parkway (the judge) and a simulated Sunrise.
+        case = Case(preferences=clinic_patient().preferences, mode=DemoMode.BE_THE_CLINIC)
+        clinics = 2
+    else:
+        # A patient case has no preferences until intake fills them.
+        case = Case(preferences=DEMO_PREFERENCES if body.mode == "watch" else None, mode=DemoMode.WATCH)
+    store.create(case, voice=body.voice, clinics=clinics)
+    log.info("case=%s created (%s, voice %s, %d clinics)", case.id, body.mode, body.voice, clinics)
     return {"case_id": case.id}
 
 
@@ -233,7 +268,7 @@ class Start(BaseModel):
 
 
 class Listen(BaseModel):
-    """Start the patient's voice intake: Lana greets them and the mic audio is transcribed."""
+    """Start the patient's voice intake (or Be the clinic's briefing): Lana talks, the mic is transcribed."""
 
     type: Literal["listen"]
 
@@ -276,11 +311,16 @@ async def _run_and_ring(orchestrator: Orchestrator) -> None:
         await orchestrator.start_callback()
 
 
-async def run_case(record: CaseRecord, bus: AudioBus, orchestrator: Orchestrator) -> None:
-    """Run the case. A usage limit cancels the orchestrator and sends one limit error."""
+async def run_case(
+    record: CaseRecord, bus: AudioBus, orchestrator: Orchestrator, callback: bool = True
+) -> None:
+    """Run the case. A usage limit cancels the orchestrator and sends one limit error.
+
+    Be the clinic has no callback (callback=False): the run ends at OFFERS_READY.
+    """
     usage = guard.CaseUsage(record.case.id)
     with guard.case_usage(usage):
-        inner = asyncio.create_task(_run_and_ring(orchestrator))
+        inner = asyncio.create_task(_run_and_ring(orchestrator) if callback else orchestrator.run())
     usage.on_limit = inner.cancel
     try:
         await inner
@@ -334,22 +374,39 @@ IDLE_CLOSE_S = 3.0  # no mic frame for this long: close the STT session until on
 
 
 class LineClock:
-    """Estimates when Lana's current line ends in the browser, from what the bus sends."""
+    """Estimates when Lana's current line ends in the browser, from what the bus sends.
 
-    def __init__(self) -> None:
+    With call_lines (Be the clinic) the voiced call lines count too, Lana's and the simulated
+    clinic's, so the judge's turn starts only once the browser has played everything before it.
+    The judge's own lines have no audio and never count.
+    """
+
+    def __init__(self, call_lines: bool = False) -> None:
+        self._call_lines = call_lines
         self._open = False  # her line's text went out and its last audio frame hasn't
         self._bytes = 0
         self._words = 0
         self._until = 0.0
+
+    def _opens(self, payload: dict) -> bool:
+        kind = payload.get("type")
+        if kind == "agent_said":
+            return True
+        return (
+            self._call_lines
+            and kind == "transcript_final"
+            and not payload.get("judge")
+            and payload.get("speaker") in (Speaker.AGENT.value, Speaker.CLINIC.value)
+        )
 
     def track(self, payload: dict) -> None:
         kind = payload.get("type")
         if kind == "audio" and payload.get("cut"):
             self.interrupt()  # a line cut short by the patient ends now
             return
-        if kind == "agent_said":
+        if self._opens(payload):
             self._open, self._bytes, self._words = True, 0, len(payload.get("text", "").split())
-        elif kind == "audio" and self._open and payload.get("speaker") == Speaker.AGENT.value:
+        elif kind == "audio" and self._open and (self._call_lines or payload.get("speaker") == Speaker.AGENT.value):
             self._bytes += len(payload.get("chunk_b64", "")) * 3 // 4
             if payload.get("last"):
                 seconds = self._bytes / MP3_BYTES_PER_S if self._bytes else self._words / TEXT_WORDS_PER_S
@@ -377,11 +434,20 @@ def is_step_away(text: str) -> bool:
     return _normalize(text) in STEP_AWAY_PHRASES
 
 
-Phase = Literal["intake", "calls", "callback", "over"]
+def is_ready(text: str) -> bool:
+    """The judge is ready for Lana's call: "ready", "let's go", or a plain yes."""
+    return _normalize(text) in READY_PHRASES or match_command(text) == SpokenCommand.YES_BOOK
+
+
+# Be the clinic adds two: the briefing on Home, then the judge's call.
+Phase = Literal["intake", "calls", "callback", "over", "briefing", "clinic"]
 
 
 class PatientSession:
     """The patient's voice on one socket: intake, then step away during the calls, then the callback.
+
+    In Be the clinic the same voice is the judge's: the briefing, then every committed turn
+    goes to the clinic's JudgeLine (`judge`) instead of intake.
 
     Every task runs inside this session's CaseUsage, so intake LLM calls, Lana's TTS and the
     STT seconds all count against the case. A Meta session is open only while the patient may
@@ -409,6 +475,8 @@ class PatientSession:
         self.listening = phase != "over"  # mic audio goes to Meta; off after a step away or a failure
         self.thinking = False  # a turn is being handled; Lana's reply comes next
         self.orchestrator: Orchestrator | None = None  # set for the callback
+        self.judge: JudgeLine | None = None  # Be the clinic: the call the judge is on
+        self.on_hold = False  # Be the clinic: the judge's call is on hold
         self._unclear = 0  # callback answers that were neither yes nor not yet
         self._turn_heard = False  # the open Meta session heard a whole turn; it closes next
         self._audio: asyncio.Queue[bytes] = asyncio.Queue()
@@ -430,7 +498,7 @@ class PatientSession:
         return task
 
     def begin(self) -> None:
-        self._spawn(self._say(_greeting()))
+        self._spawn(self._say(BRIEFING if self.phase == "briefing" else _greeting()))
 
     def muted(self) -> bool:
         # After a barge-in the patient has the turn, even while Lana's turn is still finishing.
@@ -441,9 +509,10 @@ class PatientSession:
         """The patient talked over Lana (the browser stopped her audio). Not during the calls.
 
         The line in progress stops sending, the rest of her current turn is not said, and
-        what the patient says next is a new turn.
+        what the patient says next is a new turn. In Be the clinic the judge can talk over
+        her on their own call, but not while on hold.
         """
-        if self.phase in ("calls", "over"):
+        if self.phase in ("calls", "over") or (self.phase == "clinic" and not self.listening):
             return False
         log.info("case=%s barge-in during turn %d", self.record.case.id, self._turn_no)
         self._cut_turn = self._turn_no
@@ -474,6 +543,22 @@ class PatientSession:
 
     def resume_listening(self) -> None:
         self.listening = True
+
+    def hold(self, on: bool) -> None:
+        """Be the clinic: the judge is on hold while Lana calls the other clinic; nothing they say counts."""
+        self.on_hold = on
+        if on:
+            self.stop_listening()
+            self._pending = []
+        else:
+            self.resume_listening()
+
+    def call_over(self) -> None:
+        """Be the clinic: the judge's call ended."""
+        self.on_hold = False
+        self.stop_listening()
+        self._pending = []
+        self.phase = "over"
 
     async def close(self) -> None:
         self.stop_listening()
@@ -560,6 +645,8 @@ class PatientSession:
         async for event in stt:
             if isinstance(event, Partial):
                 if not self.muted() and self.phase != "calls":
+                    if self.judge is not None and self.phase == "clinic":
+                        self.judge.talking()  # mid-sentence: not a silence
                     if self._pending:
                         # Still talking after a pause: hold the turn open a while longer.
                         self._arm_commit(get_settings().end_grace_ms / 1000 + GRACE_PARTIAL_EXTRA_S)
@@ -619,6 +706,14 @@ class PatientSession:
 
     async def _handle(self, text: str) -> None:
         case_id = self.record.case.id
+        if self.phase == "clinic":
+            # The judge's words become the clinic's line on the call (shown by the orchestrator).
+            if self.judge is not None:
+                log.info("case=%s judge said %r", case_id, text)
+                self.judge.hear(text)
+            else:
+                log.info("case=%s ignored %r: the judge's call hasn't started", case_id, text)
+            return
         if self.phase == "calls":
             if is_step_away(text):
                 await self._step_away()
@@ -632,6 +727,9 @@ class PatientSession:
         if self.phase == "callback":
             await self._booking_answer(text)
             return
+        if self.phase == "briefing":
+            await self._briefing_answer(text)
+            return
         # While Lana waits on an answer to her question, short replies go straight to intake.
         command = await parse_command(text, classify=self.intake.current is None)
         log.info("case=%s heard %r -> %s", case_id, text, command or self.phase)
@@ -640,8 +738,10 @@ class PatientSession:
             self.phase = "over"
             await self._start_run(DEMO_PREFERENCES, False)
         elif command == SpokenCommand.CLINIC:
-            # TODO(Part 13): start Be the clinic.
-            await self._say(COMING_SOON)
+            # The browser starts a new Be the clinic case (POST /cases mode clinic).
+            self.stop_listening()
+            self.phase = "over"
+            await self.bus.send_payload({"type": "command", "name": "clinic"})
         elif command == SpokenCommand.START_OVER:
             self.stop_listening()
             await self.bus.send_payload({"type": "command", "name": "start_over"})
@@ -667,6 +767,17 @@ class PatientSession:
             # they can say "I'll wait".
             self.phase = "calls"
             await self._start_run(self.record.case.preferences, True)
+
+    async def _briefing_answer(self, text: str) -> None:
+        """Be the clinic's briefing: "ready" starts Lana's calls; the judge's mic stays open."""
+        if is_ready(text):
+            self.phase = "clinic"
+            await self._start_run(self.record.case.preferences, True)
+        elif match_command(text) == SpokenCommand.START_OVER:
+            self.stop_listening()
+            await self.bus.send_payload({"type": "command", "name": "start_over"})
+        else:
+            await self._say(READY_AGAIN)
 
     # ----- the callback -----
 
@@ -752,7 +863,8 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
         await websocket.close(code=4404)
         return
 
-    clock = LineClock()
+    clinic_case = record.case.mode == DemoMode.BE_THE_CLINIC
+    clock = LineClock(call_lines=clinic_case)
 
     async def send(payload: dict) -> None:
         clock.track(payload)
@@ -776,9 +888,68 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
             if session is not None and not keep_listening:
                 session.stop_listening()
             record.runs += 1
-            record.case = Case(id=record.case.id, preferences=preferences, mode=DemoMode.WATCH)
-            orchestrator = Orchestrator(record.case, bus.emit, max_clinics=record.clinics)
-            run = asyncio.create_task(run_case(record, bus, orchestrator))
+            record.case = Case(id=record.case.id, preferences=preferences, mode=record.case.mode)
+            if clinic_case:
+                orchestrator = Orchestrator(
+                    record.case, clinic_emit, max_clinics=record.clinics, receptionists=receptionists
+                )
+                run = asyncio.create_task(run_case(record, bus, orchestrator, callback=False))
+                if session is not None:
+                    # Out of STT seconds: nobody can hear the judge, so the calls stop too.
+                    session.usage.on_limit = run.cancel
+            else:
+                orchestrator = Orchestrator(record.case, bus.emit, max_clinics=record.clinics)
+                run = asyncio.create_task(run_case(record, bus, orchestrator))
+
+    # ----- Be the clinic -----
+
+    judge_calls: set[str] = set()  # call ids of the judge's clinic
+
+    async def lana_done() -> None:
+        """Until Lana's line (and every call line before it) has played in the browser."""
+        while clock.speaking():
+            await asyncio.sleep(0.05)
+
+    def receptionists(clinic: Clinic, sheet: PriceSheet, say: Say):
+        """The judge plays JUDGE_CLINIC_ID; every other clinic is simulated."""
+        if clinic.id != JUDGE_CLINIC_ID:
+            return simulated(clinic, sheet, say)
+
+        async def turn_start(phase: JudgePhase) -> None:
+            await bus.emit(JudgeTurnStart(case_id=record.case.id, clinic_id=clinic.id, phase=phase))
+
+        judge = JudgeLine(clinic, say=say, turn_start=turn_start, lana_done=lana_done)
+        if session is not None:
+            session.judge = judge
+        return judge
+
+    async def clinic_emit(event) -> None:
+        """The orchestrator's emit in Be the clinic. The judge's lines go out unvoiced, and the
+        judge's call status drives the session (listening, hold) and the browser's card."""
+        if isinstance(event, CallStatusEvent) and event.clinic_id == JUDGE_CLINIC_ID:
+            judge_calls.add(event.call_id)
+            await bus.emit(event)
+            if session is None:
+                return
+            if event.status == CallStatus.DIALING:
+                session.phase = "clinic"
+                session.resume_listening()
+            elif event.status == CallStatus.ON_HOLD:
+                session.hold(True)
+                await bus.emit(JudgeHold(case_id=record.case.id, clinic_id=event.clinic_id, on_hold=True))
+            elif event.status == CallStatus.LIVE and session.on_hold:
+                session.hold(False)
+                await bus.emit(JudgeHold(case_id=record.case.id, clinic_id=event.clinic_id, on_hold=False))
+            elif event.status == CallStatus.ENDED:
+                session.call_over()
+                # Only a hint for the card ("Thanks, bye!"): nobody waits for it.
+                await bus.emit(JudgeTurnStart(case_id=record.case.id, clinic_id=event.clinic_id, phase="wrap"))
+            return
+        if isinstance(event, TranscriptFinal) and event.call_id in judge_calls and event.speaker == Speaker.CLINIC:
+            if not guard.limit_hit():
+                await bus.send_payload(event.model_copy(update={"judge": True}).model_dump(mode="json"))
+            return
+        await bus.emit(event)
 
     def set_away(away: bool) -> None:
         # While stepped away, call lines go out as text only: no TTS spent, and the calls run faster.
@@ -797,6 +968,8 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
         await bus.send_payload({"type": "command", "name": "step_away"})
 
     def new_session(phase: Phase = "intake") -> PatientSession:
+        if phase == "intake" and clinic_case:
+            phase = "briefing"
         return PatientSession(record, bus, clock, start_run, step_away, phase=phase)
 
     async def watch() -> None:
@@ -831,7 +1004,11 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
                 )
                 continue
 
-            if isinstance(msg, Start):
+            if isinstance(msg, Start) and clinic_case:
+                await bus.send_payload(
+                    {"type": "error", "code": "bad_message", "message": "A clinic case opens with listen."}
+                )
+            elif isinstance(msg, Start):
                 if busy():
                     await bus.send_payload({"type": "error", "code": "running", "message": "The case is already running."})
                 elif not guard.allow_run(record.runs):

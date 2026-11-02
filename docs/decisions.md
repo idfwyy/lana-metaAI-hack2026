@@ -2,6 +2,18 @@
 
 Newest first.
 
+## 2026-11-01: Be the clinic: a judge plays Parkway by voice
+
+- **Entry.** "Let me be the clinic" during intake (the server sends `command: clinic`) or the quiet "or be the clinic" link creates a new case with `POST /cases {mode: "clinic"}`. It always has 2 clinics and the fixed clinic-mode patient in `demo_patients.json` (`mode: "clinic"`, never picked for Watch): braces, Arlington, under $5,000, evenings, pay in full OK. With those preferences Parkway (evening hours) is called first, then a simulated Sunrise.
+- **Briefing.** The socket opens with `listen`. Lana says the briefing on Home, and the script card shows Parkway's prices. "Ready", "let's go" or a plain yes (or the Ready button) starts the calls; anything else gets "Just say ready when you want me to call."
+- **JudgeLine** (`clinics/judge_line.py`) has the simulator's `next_line` interface. The orchestrator takes a receptionist factory: Parkway gets a JudgeLine, the others get ClinicSimulator. The judge's turns come from the same patient session (Meta endpointing, the grace merge, barge-in, STT seconds counted against the case). A turn starts once Lana's line has played in the browser: in clinic mode the line clock also times the voiced call lines. Turns heard early (a barge-in, or more words while Lana thinks) are kept and become the next reply. No floor check applies to the judge; the extractor and the negotiator still keep only their exact words.
+- **The judge picks up first.** When Parkway's call connects, Lana waits for "Parkway Orthodontics, how can I help?" (up to `JUDGE_SILENCE_S`) before her disclosure. This uses the caller's optional `answer()` hook, so simulated clinics are unchanged.
+- **Silence.** After `JUDGE_SILENCE_S` (12 s) with no turn and no speech, Lana says "Sorry, I didn't catch that." once. After a second silence she says "No worries, I'll call back another time. Thanks!" and the call ends (`CallEnded`). The quote stays partial, the run goes on, and that clinic is never called back.
+- **Hold.** The judge's answer to the hold request is any words, or nothing after `JUDGE_HOLD_S` (8 s); a silent hold adds no clinic line. While on hold the server stops listening and the browser pauses the mic (`judge_hold` events), and the Sunrise call plays.
+- **Events.** `judge_turn_start` carries a phase: greeting, price, fees, monthly, opening, hold or negotiation. A `wrap` phase follows the end of the call and is only a hint ("Thanks, bye!"); nobody waits for it. The judge's lines go out as `transcript_final` with `judge: true` and no audio, so they show at once and are never voiced.
+- **Negotiation** is unchanged: a no ends that move and Lana tries the next; there is no repeat ask. A hang-up mid-negotiation keeps what was won and counts the unanswered move as neither won nor refused.
+- **The end.** There is no callback in clinic mode. Done shows the ranked result and "You played Parkway": Parkway's final price and each concession with the judge's words and the second in the call.
+
 ## 2026-11-01: Lana understands people: no fillers, time of day, notes, honest booking
 
 - **No spoken fillers.** "Got it." / "Mm-hm." played at the wrong moments, so they are gone from the server, the prompt file and the TTS prewarm. While Lana works on her reply the browser shows it instead: a slow primary-color ring pulses around the mic (fades in and out in 200 ms, a steady ring with reduced motion) and the caption row says "Lana is thinking" in muted text.

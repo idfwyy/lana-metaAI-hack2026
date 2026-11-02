@@ -1,11 +1,12 @@
 """Orchestrator and researcher with the caller, simulator and LLM mocked. No network."""
 
+import asyncio
 from datetime import datetime
 
 import pytest
 
 from app.agent import negotiator, orchestrator
-from app.agent.caller import CLOSING_LINE, DISCLOSURE, HOLD_REQUEST, WORDS_PER_SECOND, CallResult
+from app.agent.caller import CLOSING_LINE, DISCLOSURE, HOLD_REQUEST, WORDS_PER_SECOND, CallEnded, CallResult
 from app.agent.extractor import Transcript, TranscriptLine
 from app.agent.orchestrator import (
     NO_DEAL_LINE,
@@ -23,6 +24,7 @@ from app.agent.orchestrator import (
 )
 from app.agent.negotiator import CLOSING_LINE as NEGOTIATION_CLOSING
 from app.agent.researcher import pick_clinics
+from app.clinics.judge_line import CALL_BACK_LATER, JudgeLine
 from app.clinics.simulator import is_hold_request
 from app.config import get_settings
 from app.schemas.case import Case
@@ -133,7 +135,10 @@ def world(monkeypatch: pytest.MonkeyPatch) -> World:
                 raise RuntimeError("simulated network failure")
             line = f"{DISCLOSURE_TEXT} {PRICE_QUESTION}"
             await self._say(Speaker.AGENT, line)
-            reply = await receptionist.next_line(line)
+            try:
+                reply = await receptionist.next_line(line)
+            except CallEnded:  # like the real Caller: the call stops with nothing confirmed
+                return CallResult(transcript=self.transcript, checklist=ClinicChecklist(), ended_early=True)
             t = await self._say(Speaker.CLINIC, reply)
             total, fee, evening = w.prices[self.clinic.id]
             checklist = ClinicChecklist(
@@ -144,7 +149,9 @@ def world(monkeypatch: pytest.MonkeyPatch) -> World:
             await self.on_checklist(checklist)
             if self.end_with == "hold":
                 await self._say(Speaker.AGENT, HOLD_REQUEST)
-                await self._say(Speaker.CLINIC, await receptionist.next_line(HOLD_REQUEST))
+                reply = await receptionist.next_line(HOLD_REQUEST)
+                if reply:  # like the real Caller: a silent hold says nothing
+                    await self._say(Speaker.CLINIC, reply)
             else:
                 await self._say(Speaker.AGENT, CLOSING_LINE)
             return CallResult(transcript=self.transcript, checklist=checklist)
@@ -749,3 +756,86 @@ async def test_summary_leaves_out_a_slot_outside_the_preferred_time(world: World
     assert "No opening in the patient's preferred time (mornings)" in _summary_facts(orch.case)
     assert "Not confirmed" not in _summary_facts(orch.case)
     assert "The clinic said" not in _summary_facts(orch.case)  # nothing invented without an answer
+
+
+# ---------- Be the clinic: a judge plays Parkway ----------
+
+
+class ScriptedJudge:
+    """A receptionist factory: Parkway is a JudgeLine answered from `replies` (None = silence)."""
+
+    def __init__(self, *replies: str | None) -> None:
+        self.replies = list(replies)
+        self.phases: list[str] = []
+        self.judges: list[JudgeLine] = []
+        self.built: dict[str, str] = {}
+
+    def __call__(self, clinic, sheet, say):
+        if clinic.id != "parkway":
+            receptionist = orchestrator.simulated(clinic, sheet, say)
+        else:
+            async def turn_start(phase):
+                self.phases.append(phase)
+                reply = self.replies.pop(0) if self.replies else None
+                if reply is not None:
+                    asyncio.get_running_loop().call_later(0.01, judge.hear, reply)
+
+            async def lana_done():
+                return None
+
+            judge = JudgeLine(clinic, say=say, turn_start=turn_start, lana_done=lana_done, silence_s=0.05, hold_s=0.05)
+            self.judges.append(judge)
+            receptionist = judge
+        self.built[clinic.id] = type(receptionist).__name__
+        return receptionist
+
+
+async def _judge_run(factory: ScriptedJudge) -> tuple[Case, list]:
+    events: list = []
+    case = Case(preferences=_prefs())
+    await Orchestrator(case, events.append, max_clinics=2, receptionists=factory).run()
+    return case, events
+
+
+async def test_the_judge_plays_parkway_and_sunrise_is_simulated(world: World) -> None:
+    world.readings = [{"verdict": "no", "evidence": "can't go that low"}] * 4
+    factory = ScriptedJudge("It's $4,800 and the records fee is $250.", "Sure.", *["Sorry, we can't go that low."] * 4)
+
+    case, events = await _judge_run(factory)
+
+    assert factory.built == {"parkway": "JudgeLine", "sunrise": "FakeSim"}
+    assert list(world.sims) == ["sunrise"]  # only Sunrise is simulated
+    assert factory.phases[:3] == ["price", "hold", "negotiation"]
+    assert factory.judges[0].stage == "negotiation"
+    parkway = _lines(events, _call_ids(events, "parkway")[0])
+    assert [line.text for line in parkway if line.speaker == Speaker.CLINIC][:2] == [
+        "It's $4,800 and the records fee is $250.", "Sure.",
+    ]
+    assert case.negotiation is not None and case.negotiation.concessions == []
+    assert case.status == S.OFFERS_READY
+
+
+async def test_a_silent_judge_is_still_put_on_hold(world: World) -> None:
+    factory = ScriptedJudge("It's $4,800 and the records fee is $250.", None)
+
+    case, events = await _judge_run(factory)
+
+    parkway = _lines(events, _call_ids(events, "parkway")[0])
+    hold = next(i for i, line in enumerate(parkway) if line.text == HOLD_REQUEST)
+    assert parkway[hold + 1].speaker == Speaker.AGENT  # no clinic line: nobody answered the hold
+    assert parkway[hold + 1].text.startswith(RESUME_LINE)
+    assert S.HOLDING in _statuses(events)
+
+
+async def test_a_judge_who_hangs_up_is_not_called_back_and_the_run_goes_on(world: World) -> None:
+    factory = ScriptedJudge(None, None)
+
+    case, events = await _judge_run(factory)
+
+    assert len(_call_ids(events, "parkway")) == 1  # never called back
+    parkway = _lines(events, _call_ids(events, "parkway")[0])
+    assert parkway[-1].text == CALL_BACK_LATER
+    assert S.HOLDING not in _statuses(events)
+    assert _call_ids(events, "sunrise")  # the run continues
+    assert case.status == S.OFFERS_READY
+    assert next(q for q in case.quotes if q.clinic_id == "parkway").all_in_price is None  # the quote stays partial

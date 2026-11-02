@@ -451,3 +451,69 @@ async def test_a_must_have_a_clinic_can_answer_is_asked_as_the_note(chat, no_ext
     )
 
     assert "Does anyone at your office speak Spanish?" in _lana(lines)
+
+
+# ---------- Be the clinic: a receptionist that picks up first, or hangs up ----------
+
+
+class PicksUp(FakeReceptionist):
+    """Like the judge: answers the phone first, then ends the call after `hang_up_after` replies."""
+
+    def __init__(self, greeting: str | None, hang_up_after: int | None = None, reply: str = "Let me check.") -> None:
+        super().__init__(reply)
+        self.greeting = greeting
+        self.hang_up_after = hang_up_after
+
+    async def answer(self) -> str | None:
+        return self.greeting
+
+    async def next_line(self, lana_line: str) -> str:
+        if self.hang_up_after is not None and len(self.heard) >= self.hang_up_after:
+            self.heard.append(lana_line)
+            raise caller.CallEnded("silent")
+        return await super().next_line(lana_line)
+
+
+async def test_a_receptionist_that_picks_up_speaks_first(chat, no_extraction) -> None:
+    lines, on_line = _recorder()
+
+    await Caller(_clinic("parkway"), PREFS, on_line).run(PicksUp("Parkway Orthodontics, how can I help?"))
+
+    assert lines[0][:2] == (Speaker.CLINIC, "Parkway Orthodontics, how can I help?")
+    assert lines[1][0] == Speaker.AGENT and lines[1][1].startswith(DISCLOSURE.format(agent_name=get_settings().agent_name))
+
+
+async def test_no_greeting_means_lana_opens_the_call(chat, no_extraction) -> None:
+    lines, on_line = _recorder()
+
+    await Caller(_clinic("parkway"), PREFS, on_line).run(PicksUp(None))
+
+    assert lines[0][0] == Speaker.AGENT
+
+
+async def test_a_hang_up_ends_the_call_with_the_checklist_so_far(chat, monkeypatch) -> None:
+    async def total_only(checklist, transcript):
+        return checklist.model_copy(update={"total_price": _answer(4800)})
+
+    monkeypatch.setattr(caller, "update_checklist", total_only)
+    lines, on_line = _recorder()
+
+    result = await Caller(_clinic("parkway"), PREFS, on_line, end_with="hold").run(PicksUp(None, hang_up_after=1))
+
+    assert result.ended_early
+    assert result.checklist.total_price.value == 4800
+    assert HOLD_REQUEST not in _lana(lines) and CLOSING_LINE not in _lana(lines)
+
+
+async def test_a_silent_hold_says_no_clinic_line(chat, no_extraction) -> None:
+    class SilentOnHold(FakeReceptionist):
+        async def next_line(self, lana_line: str) -> str:
+            self.heard.append(lana_line)
+            return "" if is_hold_request(lana_line) else self.reply
+
+    lines, on_line = _recorder()
+
+    result = await Caller(_clinic(), PREFS, on_line, end_with="hold").run(SilentOnHold())
+
+    assert lines[-1][:2] == (Speaker.AGENT, HOLD_REQUEST)
+    assert not result.ended_early

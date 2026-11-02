@@ -25,12 +25,22 @@ interface Props {
   phrases: string[];
   /** Fallback (no mic, or no speech to text): each phrase is a button that sends it. */
   onPick?: (phrase: string) => void;
+  /** The heading when the phrases are only suggestions; defaults to "YOU CAN SAY". */
+  label?: string;
+  /** No card of its own: for use inside another card (JudgeScriptCard). */
+  bare?: boolean;
 }
 
-export function FlashCard({ phrases, onPick }: Props) {
+export function FlashCard({ phrases, onPick, label = "YOU CAN SAY", bare = false }: Props) {
   return (
-    <div className="w-full max-w-[460px] rounded-[16px] border border-hairline bg-surface px-4 py-3 text-left shadow-soft">
-      <p className="speaker-label text-muted">{onPick ? "TAP ONE" : "YOU CAN SAY"}</p>
+    <div
+      className={
+        bare
+          ? "w-full text-left"
+          : "w-full max-w-[460px] rounded-[16px] border border-hairline bg-surface px-4 py-3 text-left shadow-soft"
+      }
+    >
+      <p className="speaker-label text-muted">{onPick ? "TAP ONE" : label}</p>
       <AnimatePresence mode="wait" initial={false}>
         <motion.ul
           key={phrases.join("|")}

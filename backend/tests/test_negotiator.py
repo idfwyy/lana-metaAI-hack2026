@@ -444,3 +444,59 @@ async def test_on_concession_runs_before_the_call_ends(monkeypatch: pytest.Monke
     assert timeline[won[0] - 1] == ("line", Speaker.CLINIC, "Good news, we can match $4,200.")
     assert timeline[won[0] + 1][1] == Speaker.AGENT
     assert timeline[-1] == ("line", Speaker.AGENT, CLOSING_LINE)
+
+
+# ---------- Be the clinic: the judge says no, or hangs up ----------
+
+
+async def test_a_judges_no_ends_that_move_and_lana_moves_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def phrase(move):
+        return move.template()
+
+    monkeypatch.setattr(negotiator, "phrase_move", phrase)
+    monkeypatch.setattr(
+        negotiator, "call_json", FakeJson(_reading(Verdict.NO, evidence="we can't go that low"), *[_reading(Verdict.NO)] * 3)
+    )
+    receptionist = FakeReceptionist("Sorry, we can't go that low.", "No.", "No.", "No.")
+    lines: list[tuple[Speaker, str, float]] = []
+
+    result = await negotiate(
+        _quotes()["parkway"], _moves(), receptionist, lambda s, t, ts: lines.append((s, t, ts)), "c1"
+    )
+
+    assert result.concessions == [] and result.final_all_in == 5050
+    assert result.refused[0] == "Price match"
+    # The match is never asked again: the next ask is a different move.
+    assert sum("could you match that price" in h for h in receptionist.heard) == 1
+    assert "records fee" in receptionist.heard[1]
+    assert lines[-1][1] == CLOSING_LINE  # a polite close, never a push
+
+
+async def test_a_hang_up_stops_the_moves_and_keeps_what_was_won(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.agent.caller import CallEnded
+
+    async def phrase(move):
+        return move.template()
+
+    class HangsUpSecond(FakeReceptionist):
+        async def next_line(self, lana_line: str) -> str:
+            if self.heard:
+                self.heard.append(lana_line)
+                raise CallEnded("silent")
+            return await super().next_line(lana_line)
+
+    monkeypatch.setattr(negotiator, "phrase_move", phrase)
+    monkeypatch.setattr(
+        negotiator, "call_json", FakeJson(_reading(Verdict.YES, new_all_in=4200, evidence="we can match $4,200"))
+    )
+    receptionist = HangsUpSecond("Okay, we can match $4,200.")
+    lines: list[tuple[Speaker, str, float]] = []
+
+    result = await negotiate(
+        _quotes()["parkway"], _moves(), receptionist, lambda s, t, ts: lines.append((s, t, ts)), "c1"
+    )
+
+    assert [c.label for c in result.concessions] == ["Price match"]
+    assert result.final_all_in == 4200
+    assert result.refused == []  # the unanswered ask is not a refusal
+    assert lines[-1][1] != CLOSING_LINE  # Lana already said goodbye on the hang-up

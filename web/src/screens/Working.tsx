@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { CallCard } from "../components/CallCard";
+import { JudgeScriptCard } from "../components/JudgeScriptCard";
 import { QuoteCard } from "../components/QuoteCard";
 import { SavedCounter } from "../components/SavedCounter";
 import { StepAway } from "../components/StepAway";
@@ -9,7 +10,8 @@ import { clinicById, shortName } from "../lib/clinics";
 import { clock } from "../lib/format";
 import { useMediaQuery, useNow } from "../lib/hooks";
 import { EASE_OUT } from "../lib/motion";
-import { isLive, leaderId, type RunState } from "../lib/state";
+import { isLive, JUDGE_CLINIC_ID, leaderId, type Line, type RunState } from "../lib/state";
+import type { ListenState } from "../lib/useCaseRun";
 
 /** The page unfolds after the orb lands: Calls, Live call, Quotes, 60ms apart. */
 function unfold(i: number) {
@@ -28,9 +30,23 @@ interface Props {
   away: boolean;
   onStepAway: () => void;
   onStepBack: () => void;
+  /** Be the clinic: the viewer plays Parkway, so their script card is on screen and there is no step away. */
+  clinic?: boolean;
+  listen?: ListenState;
+  micLevel?: () => number;
+  onSay?: (text: string) => void;
 }
 
-export function Working({ state, away, onStepAway, onStepBack }: Props) {
+/** Lana's latest line on the judge's call, for the card's captions. */
+function lanaToJudge(state: RunState): Line | null {
+  return (
+    [...state.lines]
+      .reverse()
+      .find((l) => l.speaker === "agent" && l.callId !== null && state.callClinic[l.callId] === JUDGE_CLINIC_ID) ?? null
+  );
+}
+
+export function Working({ state, away, onStepAway, onStepBack, clinic = false, listen, micLevel, onSay }: Props) {
   const wide = useMediaQuery("(min-width: 1024px)");
   const [tab, setTab] = useState<Tab>("call");
   const now = useNow(1000, isLive(state) || Object.values(state.calls).some((c) => c.phase === "on_hold"));
@@ -38,7 +54,10 @@ export function Working({ state, away, onStepAway, onStepBack }: Props) {
   const calls = <CallsList state={state} now={now} />;
   const live = <LiveCall state={state} now={now} />;
   const quotes = <QuotesList state={state} />;
-  const overlay = (
+  const script = clinic ? (
+    <JudgeScriptCard judge={state.judge} lana={lanaToJudge(state)} listen={listen} micLevel={micLevel} onSay={onSay} />
+  ) : null;
+  const overlay = clinic ? null : (
     <>
       <AnimatePresence>{away && <StepAway key="away" state={state} onBack={onStepBack} />}</AnimatePresence>
       {!away && <StepAwayButton onClick={onStepAway} />}
@@ -49,12 +68,26 @@ export function Working({ state, away, onStepAway, onStepBack }: Props) {
     return (
       <motion.div
         exit={{ opacity: 0, transition: { duration: 0.18, ease: EASE_OUT } }}
-        className="relative mx-auto grid h-[calc(100dvh-64px)] w-full max-w-[1440px] grid-cols-[280px_minmax(0,1fr)_320px] gap-6 px-8 py-6"
+        className={`relative mx-auto grid h-[calc(100dvh-64px)] w-full max-w-[1440px] gap-6 px-8 py-6 ${
+          clinic ? "grid-cols-[360px_minmax(0,1fr)_300px]" : "grid-cols-[280px_minmax(0,1fr)_320px]"
+        }`}
       >
-        <motion.section {...unfold(0)} aria-label="Calls" className="flex min-h-0 flex-col">
-          <ColumnTitle>Calls</ColumnTitle>
-          <div className="scroll-quiet min-h-0 flex-1 overflow-y-auto">{calls}</div>
-        </motion.section>
+        {clinic ? (
+          <motion.section {...unfold(0)} aria-label="Your script" className="flex min-h-0 flex-col">
+            <div className="scroll-quiet min-h-0 flex-1 overflow-y-auto pb-6">
+              {script}
+              <div className="mt-6">
+                <ColumnTitle>Calls</ColumnTitle>
+                {calls}
+              </div>
+            </div>
+          </motion.section>
+        ) : (
+          <motion.section {...unfold(0)} aria-label="Calls" className="flex min-h-0 flex-col">
+            <ColumnTitle>Calls</ColumnTitle>
+            <div className="scroll-quiet min-h-0 flex-1 overflow-y-auto">{calls}</div>
+          </motion.section>
+        )}
         <motion.section {...unfold(1)} aria-label="Live call" className="flex min-h-0 flex-col">
           {live}
         </motion.section>
@@ -95,7 +128,15 @@ export function Working({ state, away, onStepAway, onStepBack }: Props) {
         ))}
       </motion.div>
       <motion.div {...unfold(1)} role="tabpanel" className="flex min-h-0 flex-1 flex-col px-4 pb-4 pt-4">
-        {tab === "call" && live}
+        {tab === "call" &&
+          (clinic ? (
+            <div className="scroll-quiet flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto">
+              {script}
+              <div className="flex min-h-[380px] flex-col">{live}</div>
+            </div>
+          ) : (
+            live
+          ))}
         {tab === "quotes" && <div className="scroll-quiet min-h-0 flex-1 overflow-y-auto pb-24">{quotes}</div>}
         {tab === "log" && (
           <div className="scroll-quiet min-h-0 flex-1 overflow-y-auto">

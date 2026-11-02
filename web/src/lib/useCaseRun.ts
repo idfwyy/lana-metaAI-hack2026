@@ -10,7 +10,7 @@ import { toast } from "sonner";
 import { startMic, type Mic } from "./mic";
 import { Player } from "./player";
 import { CaseSocket } from "./socket";
-import { initialRun, runReducer, type RunState } from "./state";
+import { initialRun, JUDGE_CLINIC_ID, runReducer, type RunState } from "./state";
 import type { ClientMessage, IntakeTopic, Preferences, PreferencesDraft, ServerEvent } from "./types";
 
 export interface ListenState {
@@ -35,6 +35,8 @@ export interface ListenState {
   callback: boolean;
   /** Watch mode: the one talking to Lana on Home is the demo patient, not the viewer. */
   demo: boolean;
+  /** Be the clinic: the viewer is the judge, playing a clinic's front desk. */
+  clinic: boolean;
 }
 
 export const initialListen: ListenState = {
@@ -51,10 +53,11 @@ export const initialListen: ListenState = {
   preferences: null,
   callback: false,
   demo: false,
+  clinic: false,
 };
 
 type ListenAction =
-  | { kind: "listen" }
+  | { kind: "listen"; clinic?: boolean }
   | { kind: "demo" }
   | { kind: "callback" }
   | { kind: "mic"; mic: ListenState["mic"]; fallback?: boolean }
@@ -67,7 +70,7 @@ function listenReducer(state: ListenState, action: ListenAction): ListenState {
     case "reset":
       return initialListen;
     case "listen":
-      return { ...initialListen, active: true, mic: "starting" };
+      return { ...initialListen, active: true, mic: "starting", clinic: !!action.clinic };
     case "demo":
       return { ...initialListen, active: true, demo: true };
     case "callback":
@@ -89,6 +92,12 @@ function listenReducer(state: ListenState, action: ListenAction): ListenState {
       return { ...state, partial: "", heard: e.text, thinking: !state.done || state.callback };
     case "agent_said":
       return e.call_id === null ? { ...state, thinking: false } : state;
+    case "transcript_final":
+      // Be the clinic: the judge's finished turn, as it shows in the transcript.
+      return e.judge ? { ...state, partial: "", heard: e.text } : state;
+    case "case_status":
+      // Be the clinic: "ready" started the calls; nothing on Home waits on Lana any more.
+      return state.clinic ? { ...state, thinking: false } : state;
     case "command":
       // Start over or a step away: no reply from Lana follows.
       return { ...state, thinking: false };
@@ -103,11 +112,15 @@ function listenReducer(state: ListenState, action: ListenAction): ListenState {
   }
 }
 
-export function useCaseRun(onStartOver?: () => void): {
+export function useCaseRun(
+  onStartOver?: () => void,
+  /** The patient said "let me be the clinic": the app starts a new clinic case. */
+  onClinic?: () => void,
+): {
   state: RunState;
   listen: ListenState;
   start: (caseId: string) => void;
-  listenTo: (caseId: string, mic: Promise<Mic>) => void;
+  listenTo: (caseId: string, mic: Promise<Mic>, opts?: { clinic?: boolean }) => void;
   sendText: (text: string) => void;
   sendAudio: (frame: ArrayBuffer) => void;
   micLevel: () => number;
@@ -130,6 +143,12 @@ export function useCaseRun(onStartOver?: () => void): {
   const lanaToPatient = useRef(false);
   const startOver = useRef(onStartOver);
   startOver.current = onStartOver;
+  const clinicStart = useRef(onClinic);
+  clinicStart.current = onClinic;
+  /** Be the clinic: this case's judge, their call ids, and whether their mic must stay quiet (on hold or call over). */
+  const clinicCase = useRef(false);
+  const judgeCalls = useRef(new Set<string>());
+  const judgeQuiet = useRef(false);
 
   /** The patient talked over Lana: stop her here and tell the server, which cuts her line. */
   const bargeIn = useCallback(() => {
@@ -159,6 +178,8 @@ export function useCaseRun(onStartOver?: () => void): {
     dispatch({ kind: "reset" });
     listenDispatch({ kind: "reset" });
     setAway(false);
+    judgeCalls.current = new Set();
+    judgeQuiet.current = false;
   }, [stopMic]);
 
   /** Mute the calls locally; the server stops voicing them too. */
@@ -180,15 +201,29 @@ export function useCaseRun(onStartOver?: () => void): {
           if (event.type === "command" && event.name === "start_over") queueMicrotask(() => startOver.current?.());
           // The patient said "I'll wait".
           if (event.type === "command" && event.name === "step_away") goAway();
+          // The patient said "let me be the clinic": a new case, after this step.
+          if (event.type === "command" && event.name === "clinic") queueMicrotask(() => clinicStart.current?.());
+          if (clinicCase.current) {
+            if (event.type === "call_status" && event.clinic_id === JUDGE_CLINIC_ID) judgeCalls.current.add(event.call_id);
+            // On hold (Lana is calling another clinic) or after the call, the judge's mic sends nothing.
+            const quiet =
+              event.type === "judge_hold" ? event.on_hold : event.type === "judge_turn_start" ? event.phase === "wrap" : null;
+            if (quiet !== null) {
+              judgeQuiet.current = quiet;
+              if (quiet) mic.current?.pause();
+              else if (!lanaSpeaking.current) mic.current?.resume();
+            }
+          }
         },
         reveal: (seq, count) => dispatch({ kind: "reveal", seq, count }),
         speaking: (on, toPatient) => {
           lanaSpeaking.current = on;
           lanaToPatient.current = on && toPatient;
           if (on && mic.current) quietFor(mic.current);
-          else if (!on) mic.current?.resume();
+          else if (!on && !judgeQuiet.current) mic.current?.resume();
           listenDispatch({ kind: "speaking", on });
         },
+        bargeable: (callId) => clinicCase.current && !judgeQuiet.current && judgeCalls.current.has(callId),
       });
       const s = new CaseSocket(
         caseId,
@@ -198,7 +233,9 @@ export function useCaseRun(onStartOver?: () => void): {
             p.reset();
             dispatch({ kind: "reset" });
             if (opening.type === "listen") {
-              listenDispatch({ kind: "listen" });
+              judgeCalls.current = new Set();
+              judgeQuiet.current = false;
+              listenDispatch({ kind: "listen", clinic: clinicCase.current });
               listenDispatch({ kind: "mic", mic: mic.current ? "on" : "off" });
               toast("Connection dropped. Lana is starting over.");
             } else {
@@ -225,6 +262,7 @@ export function useCaseRun(onStartOver?: () => void): {
   const start = useCallback(
     (caseId: string) => {
       open(caseId, { type: "start" });
+      clinicCase.current = false;
       // Home stays up while the demo patient and Lana talk; the calls move it on.
       listenDispatch({ kind: "demo" });
     },
@@ -232,9 +270,10 @@ export function useCaseRun(onStartOver?: () => void): {
   );
 
   const listenTo = useCallback(
-    (caseId: string, micPromise: Promise<Mic>) => {
+    (caseId: string, micPromise: Promise<Mic>, opts?: { clinic?: boolean }) => {
       const s = open(caseId, { type: "listen" });
-      listenDispatch({ kind: "listen" });
+      clinicCase.current = !!opts?.clinic;
+      listenDispatch({ kind: "listen", clinic: clinicCase.current });
       micPromise.then(
         (m) => {
           if (socket.current !== s) return m.stop(); // started over while the mic was asked for
@@ -295,12 +334,14 @@ export function useCaseRun(onStartOver?: () => void): {
   }, [sendAudio, quietFor]);
 
   // A Watch run started (the patient said "just show me"): the mic's job is done. After the
-  // patient's own intake it stays open, so they can say "I'll wait".
+  // patient's own intake it stays open, so they can say "I'll wait". In Be the clinic it is the judge's voice on the call.
   useEffect(() => {
-    if (state.caseStatus !== null && !listen.done) stopMic();
-  }, [state.caseStatus, listen.done, stopMic]);
+    if (state.caseStatus !== null && !listen.done && !listen.clinic) stopMic();
+  }, [state.caseStatus, listen.done, listen.clinic, stopMic]);
 
-  const finished = state.outcome !== null || state.error !== null;
+  // Be the clinic has no callback: the run is over once the offers are in.
+  const finished =
+    state.outcome !== null || state.error !== null || (listen.clinic && state.caseStatus === "offers_ready");
   useEffect(() => {
     if (finished) {
       socket.current?.markFinished();

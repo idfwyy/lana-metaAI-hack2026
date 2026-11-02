@@ -5,7 +5,7 @@ import { AnimatedNumber } from "../components/AnimatedNumber";
 import { SavingsBreakdown } from "../components/SavingsBreakdown";
 import { clock, humanize, money } from "../lib/format";
 import { EASE_DRAWER, EASE_IN_OUT, EASE_OUT } from "../lib/motion";
-import type { Outcome } from "../lib/state";
+import { JUDGE_CLINIC_ID, type Outcome } from "../lib/state";
 import type { Offer } from "../lib/types";
 
 /** "Tue, Nov 3 · 5:30 PM" in the demo clinics' time zone. */
@@ -32,10 +32,13 @@ interface Props {
   /** How Lana's callback ended. */
   outcome: Outcome | null;
   onStartOver: () => void;
+  /** Be the clinic: the viewer played Parkway; show what Lana got from them. */
+  clinic?: boolean;
 }
 
-export function Done({ offers, outcome, onStartOver }: Props) {
+export function Done({ offers, outcome, onStartOver, clinic: clinicMode = false }: Props) {
   const [top, ...others] = offers;
+  const played = clinicMode ? offers.find((o) => o.clinic.id === JUDGE_CLINIC_ID) : undefined;
 
   if (!top) {
     return (
@@ -102,7 +105,9 @@ export function Done({ offers, outcome, onStartOver }: Props) {
       )}
 
       <motion.div {...enter(0.28)} className="mt-10">
-        {negotiation ? (
+        {played === top ? (
+          <YouPlayed offer={top} />
+        ) : negotiation ? (
           <SavingsBreakdown negotiation={negotiation} clinicName={clinic.name} />
         ) : (
           quoted && (
@@ -124,10 +129,67 @@ export function Done({ offers, outcome, onStartOver }: Props) {
         </motion.div>
       )}
 
+      {played && played !== top && (
+        <motion.div {...enter(0.36)} className="mt-6">
+          <YouPlayed offer={played} />
+        </motion.div>
+      )}
+
       <motion.div {...enter(0.4)}>
         <StartOver onClick={onStartOver} />
       </motion.div>
     </main>
+  );
+}
+
+/** Be the clinic: what Lana got from the judge, each line backed by their own words. */
+function YouPlayed({ offer }: { offer: Offer }) {
+  const deal = offer.negotiation;
+  const final = deal?.final_all_in ?? offer.quote.all_in_price;
+  const quoted = offer.quote.checklist.total_price;
+
+  return (
+    <section className="rounded-[20px] border border-hairline bg-surface p-5 text-left sm:p-6">
+      <div className="flex items-baseline justify-between gap-4">
+        <h3 className="font-serif text-[24px] font-normal leading-[1.15] text-ink">You played Parkway</h3>
+        <p className="shrink-0 text-[14px] text-muted">
+          Final{" "}
+          <span className="font-mono text-[18px] font-medium text-ink tnum">{final !== null ? money(final) : "Not confirmed"}</span>
+        </p>
+      </div>
+
+      {deal && deal.concessions.length > 0 ? (
+        <>
+          <p className="mt-3 text-[15px] text-muted">
+            Lana got {money(deal.total_saved)} off your first price of {money(deal.first_all_in)}.
+          </p>
+          <ul className="mt-4 flex flex-col gap-4">
+            {deal.concessions.map((c, i) => (
+              <li key={i} className="border-t border-hairline pt-4 first:border-t-0 first:pt-0">
+                <p className="flex items-baseline justify-between gap-3 text-[15px] font-medium text-ink">
+                  {c.label}
+                  {c.amount > 0 && <span className="font-mono text-[14px] text-primary tnum">-{money(c.amount)}</span>}
+                </p>
+                <p className="mt-1.5 text-[15px] text-ink">You said “{c.evidence.evidence}”</p>
+                <p className="mt-1 font-mono text-[12px] text-muted tnum">at {clock(c.evidence.t_seconds)} in the call</p>
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : quoted ? (
+        <>
+          <p className="mt-3 text-[15px] text-muted">You held your price. Lana took the quote as you gave it.</p>
+          <p className="mt-3 text-[15px] text-ink">You said “{quoted.evidence}”</p>
+          <p className="mt-1 font-mono text-[12px] text-muted tnum">at {clock(quoted.t_seconds)} in the call</p>
+        </>
+      ) : (
+        <p className="mt-3 text-[15px] text-muted">Lana didn't get a full price from you, so your quote is marked not confirmed.</p>
+      )}
+
+      {deal && deal.refused.length > 0 && (
+        <p className="mt-4 text-[13px] text-muted">You turned down: {deal.refused.join(", ").toLowerCase()}.</p>
+      )}
+    </section>
   );
 }
 

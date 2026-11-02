@@ -6,6 +6,9 @@ Preferences. The opening price question is Python's: one of a few wordings, neve
 the last call used, so each call sounds a little different and starts without a model call.
 Python also says the slot question when the patient wants a time of day ("Do you have any
 morning openings next week?"), and at most one question from the patient's notes per call.
+
+A receptionist with an answer() method (the judge in Be the clinic) picks up first, and one
+that raises CallEnded hangs up: the call stops with the checklist it has so far.
 """
 
 import inspect
@@ -93,10 +96,15 @@ class Receptionist(Protocol):
     async def next_line(self, lana_line: str) -> str: ...
 
 
+class CallEnded(Exception):
+    """The receptionist ended the call (the judge stayed silent); Lana already said goodbye."""
+
+
 @dataclass
 class CallResult:
     transcript: Transcript
     checklist: ClinicChecklist
+    ended_early: bool = False  # the receptionist hung up before Lana finished
 
 
 def _yes_no(value: bool) -> str:
@@ -228,12 +236,27 @@ class Caller:
         )
 
     async def run(self, receptionist: Receptionist) -> CallResult:
+        try:
+            await self._converse(receptionist)
+        except CallEnded as err:
+            log.info("caller call=%s ended by the clinic: %s", self.transcript.call_id, err)
+            return CallResult(transcript=self.transcript, checklist=self.checklist, ended_early=True)
+        return CallResult(transcript=self.transcript, checklist=self.checklist)
+
+    async def _converse(self, receptionist: Receptionist) -> None:
+        answer = getattr(receptionist, "answer", None)
+        if answer is not None:
+            greeting = await answer()
+            if greeting:
+                await self._say(Speaker.CLINIC, greeting)
         while True:
             fields = self._fields_to_ask()
             if not fields or self._lana_turns >= MAX_LANA_TURNS - 1:
                 if self.end_with == "hold":
                     await self._say(Speaker.AGENT, HOLD_REQUEST)
-                    await self._say(Speaker.CLINIC, await receptionist.next_line(HOLD_REQUEST))
+                    reply = await receptionist.next_line(HOLD_REQUEST)
+                    if reply:  # a judge who says nothing is just on hold
+                        await self._say(Speaker.CLINIC, reply)
                 else:
                     await self._say(Speaker.AGENT, CLOSING_LINE)
                 break
@@ -247,7 +270,6 @@ class Caller:
             reply = await receptionist.next_line(line)
             await self._say(Speaker.CLINIC, reply)
             await self._extract()
-        return CallResult(transcript=self.transcript, checklist=self.checklist)
 
     def _fields_to_ask(self) -> list[str]:
         """Missing fields from DEMO_CHECKLIST, in order. The extractor still fills the others."""

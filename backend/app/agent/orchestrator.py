@@ -3,6 +3,10 @@
 Plain Python decides the call order, when to hold and resume, and who to negotiate with.
 AI runs only inside the steps it calls (caller, extractor, negotiator phrasing, tradeoffs,
 the callback summary).
+
+Each call's receptionist comes from a factory: a ClinicSimulator by default, or in Be the
+clinic a JudgeLine for the clinic the judge plays. A receptionist that hangs up ends its call
+early; that clinic is never put on hold or called back.
 """
 
 import inspect
@@ -16,11 +20,12 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from app.agent.caller import WORDS_PER_SECOND, Caller
+from app.agent.caller import WORDS_PER_SECOND, Caller, Receptionist
 from app.agent.extractor import build_quote
 from app.agent.negotiator import MoveKind, negotiate, pick_target, plan_moves
 from app.agent.ranker import add_tradeoffs, rank_offers
 from app.agent.researcher import pick_clinics, slot_matches
+from app.clinics.judge_line import JudgeLine
 from app.clinics.simulator import ClinicSimulator, dollar_amounts
 from app.config import get_settings
 from app.data.loader import load_demo_clinics
@@ -92,6 +97,14 @@ AWAY_LINE = "I made {n} call{s} while you were away."
 _GREETING_RE = re.compile(r"^\s*(?:hi|hey|hello)\b[^.!?]*[.!?]\s*", re.IGNORECASE)
 
 Emit = Callable[[BaseModel], None | Awaitable[None]]
+# Builds one call's receptionist. `say` is Lana's line on that call, for receptionists that
+# need her to speak on their own (the judge's "Sorry, I didn't catch that.").
+Say = Callable[[str], Awaitable[None]]
+ReceptionistFactory = Callable[[Clinic, PriceSheet, Say], Receptionist]
+
+
+def simulated(clinic: Clinic, sheet: PriceSheet, say: Say) -> Receptionist:
+    return ClinicSimulator(clinic, sheet)
 
 
 class IllegalTransition(Exception):
@@ -267,9 +280,10 @@ class _Call:
     ) -> None:
         self.orchestrator = orchestrator
         self.clinic = clinic
-        self.receptionist = ClinicSimulator(clinic, sheet)
         self.call_id = f"{clinic.id}-{uuid.uuid4().hex[:6]}"
         self.clock = 0.0
+        self.ended_early = False  # the receptionist hung up
+        self.receptionist = orchestrator.receptionists(clinic, sheet, self.say)
 
     async def line(self, speaker: Speaker, text: str, t_seconds: float) -> None:
         """on_line for Caller and negotiate(): emit the line and remember where the call is."""
@@ -300,12 +314,19 @@ class _Call:
 
 
 class Orchestrator:
-    def __init__(self, case: Case, emit: Emit, max_clinics: int = 3) -> None:
+    def __init__(
+        self,
+        case: Case,
+        emit: Emit,
+        max_clinics: int = 3,
+        receptionists: ReceptionistFactory | None = None,
+    ) -> None:
         if max_clinics not in (2, 3):
             raise ValueError("max_clinics must be 2 or 3")
         self.case = case
         self.emit = emit
         self.max_clinics = max_clinics
+        self.receptionists = receptionists or simulated
         self._step = "starting the case"
         self._sheets: dict[str, PriceSheet] = {}
         self.summary: str | None = None  # set by start_callback()
@@ -387,27 +408,33 @@ class Orchestrator:
         first, others = clinics[0], clinics[1:]
         await self.advance(S.CALLING)
         held = await self._checklist_call(first, end_with="hold" if others else "close")
-        if others:
+        hung_up = {first.id} if held.ended_early else set()
+        if others and not held.ended_early:
             self.case.held_call_id = held.call_id
             await self.advance(S.HOLDING)
             await held.status(CallStatus.ON_HOLD)
             await self._log(self._hold_line(first, others))
         else:
             await held.status(CallStatus.ENDED)
+            if held.ended_early:
+                await self._log(f"{_short(first.name)} went quiet, so I'll call them back another time")
 
         for clinic in others:
             await self.advance(S.CALLING)
             call = await self._checklist_call(clinic, end_with="close")
             await call.status(CallStatus.ENDED)
+            if call.ended_early:
+                hung_up.add(clinic.id)
             await self._log(self._compare_line(clinic, first))
 
-        if others:
+        if self.case.held_call_id is not None:
             negotiation = await self._resume(held)
         else:
             await self.advance(S.QUOTES_IN)
             negotiation = None
             target_id = pick_target(self.case.quotes, self.case.clinics, prefs)
-            if target_id is not None:
+            # A clinic that hung up is never called right back.
+            if target_id is not None and target_id not in hung_up:
                 await self.advance(S.NEGOTIATING)
                 negotiation = await self._negotiate(self._new_call(self._clinic(target_id)))
 
@@ -472,6 +499,7 @@ class Orchestrator:
             on_checklist=on_checklist,
         )
         result = await caller.run(call.receptionist)
+        call.ended_early = result.ended_early
         if not any(q.clinic_id == clinic.id for q in self.case.quotes):
             await self._set_quote(build_quote(clinic.id, result.checklist))
         return call
@@ -524,6 +552,8 @@ class Orchestrator:
             )
 
         await call.status(CallStatus.NEGOTIATING)
+        if isinstance(call.receptionist, JudgeLine):
+            call.receptionist.stage = "negotiation"
         result = await negotiate(
             quote,
             moves,

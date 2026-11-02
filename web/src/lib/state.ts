@@ -1,7 +1,10 @@
 // View state for a run. The player applies server events here in seq order.
 
 import { clinicById, parseCallOrder } from "./clinics";
-import type { CaseStatus, Concession, Offer, Quote, ServerEvent, SourcedAnswer } from "./types";
+import type { CaseStatus, Concession, JudgePhase, Offer, Quote, ServerEvent, SourcedAnswer } from "./types";
+
+/** Be the clinic: the clinic the judge plays (backend clinics/judge_line.py JUDGE_CLINIC_ID). */
+export const JUDGE_CLINIC_ID = "parkway";
 
 export type CallPhase = "waiting" | "dialing" | "live" | "on_hold" | "negotiating" | "done";
 
@@ -22,6 +25,20 @@ export interface Line {
   words: string[];
   revealed: number;
   tSeconds: number | null;
+  /** Be the clinic: the judge said this line themselves. */
+  judge?: boolean;
+}
+
+/** Be the clinic: where the judge is on their call. */
+export interface JudgeView {
+  clinicId: string;
+  /** What Lana asked last; "wrap" once the call is over. */
+  phase: JudgePhase;
+  /** Lana is waiting for the judge to speak. */
+  yourTurn: boolean;
+  onHold: boolean;
+  /** ms (performance clock) when the hold started. */
+  holdSince: number | null;
 }
 
 export interface LogEntry {
@@ -64,6 +81,8 @@ export interface RunState {
   outcome: Outcome | null;
   error: { message: string; code?: string } | null;
   firstAt: number | null;
+  /** Be the clinic only; null until Lana calls the judge. */
+  judge: JudgeView | null;
 }
 
 export const initialRun: RunState = {
@@ -80,6 +99,7 @@ export const initialRun: RunState = {
   outcome: null,
   error: null,
   firstAt: null,
+  judge: null,
 };
 
 export type RunAction =
@@ -161,15 +181,46 @@ export function runReducer(state: RunState, action: RunAction): RunState {
     case "transcript_final": {
       const speaker = e.type === "agent_said" ? "agent" : e.speaker;
       if (speaker === "patient") return s;
+      const words = e.text.split(/\s+/).filter(Boolean);
+      const judge = e.type === "transcript_final" && e.judge === true;
       const line: Line = {
         seq: e.seq ?? s.lines.length,
         callId: e.call_id,
         speaker,
-        words: e.text.split(/\s+/).filter(Boolean),
-        revealed: 0,
+        words,
+        // The judge already said it: the whole line shows at once.
+        revealed: judge ? words.length : 0,
         tSeconds: e.type === "transcript_final" ? e.t_seconds : null,
+        judge,
       };
-      return { ...s, lines: [...s.lines, line], currentCallId: e.call_id ?? s.currentCallId };
+      // Any line on the judge's call (theirs or Lana's) means it is no longer their turn.
+      const onJudgeCall = s.judge !== null && e.call_id !== null && s.callClinic[e.call_id] === s.judge.clinicId;
+      return {
+        ...s,
+        lines: [...s.lines, line],
+        currentCallId: e.call_id ?? s.currentCallId,
+        judge: onJudgeCall && s.judge ? { ...s.judge, yourTurn: false } : s.judge,
+      };
+    }
+
+    case "judge_turn_start":
+      return {
+        ...s,
+        judge: {
+          clinicId: e.clinic_id,
+          phase: e.phase,
+          yourTurn: e.phase !== "wrap",
+          onHold: false,
+          holdSince: null,
+        },
+      };
+
+    case "judge_hold": {
+      const prev = s.judge ?? { clinicId: e.clinic_id, phase: "hold" as const, yourTurn: false, onHold: false, holdSince: null };
+      return {
+        ...s,
+        judge: { ...prev, yourTurn: false, onHold: e.on_hold, holdSince: e.on_hold ? action.now : null },
+      };
     }
 
     case "quote_updated": {
