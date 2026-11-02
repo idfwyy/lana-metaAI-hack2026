@@ -1,7 +1,12 @@
 import { useId, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { ChevronDown } from "lucide-react";
+import { unlockAudio } from "../lib/audio";
 import { EASE_DRAWER } from "../lib/motion";
+
+/** Flips closer together than this are ignored, so a double tap can't leave sound out of step. */
+const SOUND_DEBOUNCE_MS = 300;
+let lastSoundFlip = -Infinity; // shared by every Sound switch: they all set the same state
 
 export const DISCLAIMER =
   "Quick heads-up: this is a live demo. To respect real clinics' time, I won't call real offices during judging. I'll call demo clinics instead. Each one is its own AI receptionist with hidden prices and limits, so I really do have to negotiate. Every call starts with me saying I'm an AI, and your voice is only used for this session.";
@@ -77,8 +82,27 @@ export function DemoFooter({ voice, setVoice, clinics, setClinics, onHowItWorks 
   );
 }
 
-/** Lana speaks out loud, or text only. Shared by the footer and the welcome card. */
-export function SoundSwitch({ voice, setVoice }: { voice: boolean; setVoice: (v: boolean) => void }) {
+/**
+ * Lana speaks out loud, or text only. Shared by the footer, the welcome card and the top bar,
+ * all on App's one voice state. compact: no on/off word, for the top bar.
+ */
+export function SoundSwitch({
+  voice,
+  setVoice,
+  compact = false,
+}: {
+  voice: boolean;
+  setVoice: (v: boolean) => void;
+  compact?: boolean;
+}) {
+  function toggle() {
+    const now = performance.now();
+    if (now - lastSoundFlip < SOUND_DEBOUNCE_MS) return;
+    lastSoundFlip = now;
+    if (!voice) unlockAudio(); // turning sound on is the gesture that lets the browser play again
+    setVoice(!voice);
+  }
+
   return (
     <label className="inline-flex cursor-pointer items-center gap-2">
       Sound
@@ -86,7 +110,7 @@ export function SoundSwitch({ voice, setVoice }: { voice: boolean; setVoice: (v:
         type="button"
         role="switch"
         aria-checked={voice}
-        onClick={() => setVoice(!voice)}
+        onClick={toggle}
         className={`relative h-5 w-9 rounded-full transition-colors duration-200 ${voice ? "bg-primary" : "bg-hairline"}`}
       >
         <span
@@ -94,7 +118,7 @@ export function SoundSwitch({ voice, setVoice }: { voice: boolean; setVoice: (v:
           style={{ transform: voice ? "translateX(16px)" : "none" }}
         />
       </button>
-      <span className="w-6 text-ink">{voice ? "on" : "off"}</span>
+      {!compact && <span className="w-6 text-ink">{voice ? "on" : "off"}</span>}
     </label>
   );
 }

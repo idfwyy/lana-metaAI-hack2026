@@ -51,10 +51,14 @@ def _script(case_id: str) -> list:
     ]
 
 
+PAUSE = object()  # in a script: the fake orchestrator waits here until world.resume is set
+
+
 class World:
     def __init__(self) -> None:
         self.script = _script
         self.hang = False  # the fake orchestrator waits forever after its script
+        self.resume = threading.Event()
         self.cancelled = threading.Event()
         self.runs = 0
         self.max_clinics: list[int] = []
@@ -159,7 +163,10 @@ def world(monkeypatch) -> World:
                 return await clinic_run(self)
             try:
                 for event in w.script(self.case.id):
-                    await self.emit(event)
+                    while event is PAUSE and not w.resume.is_set():
+                        await asyncio.sleep(0.01)
+                    if event is not PAUSE:
+                        await self.emit(event)
                     await asyncio.sleep(0)
                 if w.hang:
                     await asyncio.Event().wait()
@@ -425,9 +432,12 @@ def test_unused_messages_are_ignored_and_bad_ones_rejected(client, world) -> Non
     with client.websocket_connect(f"/ws/case/{case_id}") as ws:
         ws.send_json({"type": "user_text", "text": "hello"})
         ws.send_json({"type": "command", "name": "skip"})
+        ws.send_json({"type": "set_sound", "on": True})  # an old message: rejected, the socket stays up
+        msg = ws.receive_json()
+        assert msg["type"] == "error" and msg["code"] == "bad_message"
         ws.send_json({"type": "dance"})
         msg = ws.receive_json()
-        assert msg["type"] == "error" and msg["code"] == "bad_message" and msg["seq"] == 1
+        assert msg["type"] == "error" and msg["code"] == "bad_message" and msg["seq"] == 2
     assert world.runs == 0
 
 
@@ -789,6 +799,65 @@ def test_tapping_step_away_turns_call_audio_off_and_back_on(client, world) -> No
         _wait_for(lambda: store.get(case_id).voice is False)
         ws.send_json({"type": "command", "name": "step_back"})
         _wait_for(lambda: store.get(case_id).voice is True)
+
+
+def _paused_after_lanas_line(world) -> None:
+    def script(case_id):
+        events = _script(case_id)
+        return events[:4] + [PAUSE] + events[4:]  # pause between Lana's line and the clinic's
+
+    world.script = script
+
+
+def test_need_audio_voices_the_asked_lines_and_every_line_after(client, world) -> None:
+    _paused_after_lanas_line(world)
+    case_id = _new_case(client, voice=False)
+    with client.websocket_connect(f"/ws/case/{case_id}") as ws:
+        ws.send_json({"type": "start"})
+        before = _until(ws, lambda m: m["type"] == "audio" and m["last"])
+        [lana] = _lines(before)
+        ws.send_json({"type": "need_audio", "line_seqs": [lana["seq"]], "after": before[-1]["seq"]})
+        late = _until(ws, lambda m: m["type"] == "audio" and m.get("late") and m["last"])
+        _wait_for(lambda: store.get(case_id).voice is True)
+        world.resume.set()
+        after = _until_done(ws)
+
+    assert [f.get("failed") for f in _audio(before, lana["seq"])] == [True]
+    frames = _audio(late, lana["seq"])
+    assert len(frames) == len(world.chunks) and all(f["late"] for f in frames)
+    [clinic] = _lines(after)
+    clinic_frames = _audio(after, clinic["seq"])
+    assert len(clinic_frames) == len(world.chunks) and not any(f.get("late") for f in clinic_frames)
+    # Lana's line in her voice, from the text already sent; then the clinic's line as usual.
+    assert [s[1] for s in world.spoken] == ["lana-voice", "clinic-1-voice"]
+
+
+def test_need_audio_also_voices_lines_the_browser_had_not_seen(client, world) -> None:
+    _paused_after_lanas_line(world)
+    case_id = _new_case(client, voice=False)
+    with client.websocket_connect(f"/ws/case/{case_id}") as ws:
+        ws.send_json({"type": "start"})
+        before = _until(ws, lambda m: m["type"] == "audio" and m["last"])
+        [lana] = _lines(before)
+        # The browser asked before Lana's line reached it: nothing to name, only where it was.
+        ws.send_json({"type": "need_audio", "line_seqs": [], "after": lana["seq"] - 1})
+        late = _until(ws, lambda m: m["type"] == "audio" and m.get("late") and m["last"])
+        world.resume.set()
+    assert late[-1]["line_seq"] == lana["seq"] and "chunk_b64" in late[-1]
+
+
+def test_need_audio_ignores_lines_that_already_had_audio(client, world) -> None:
+    _paused_after_lanas_line(world)
+    case_id = _new_case(client)
+    with client.websocket_connect(f"/ws/case/{case_id}") as ws:
+        ws.send_json({"type": "start"})
+        before = _until(ws, lambda m: m["type"] == "audio" and m["last"])
+        [lana] = _lines(before)
+        ws.send_json({"type": "need_audio", "line_seqs": [lana["seq"]], "after": 0})
+        world.resume.set()
+        after = _until_done(ws)
+    assert not any(m.get("late") for m in after)
+    assert [s[1] for s in world.spoken] == ["lana-voice", "clinic-1-voice"]
 
 
 def _answered(ws) -> list[dict]:

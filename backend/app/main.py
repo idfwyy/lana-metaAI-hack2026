@@ -299,8 +299,20 @@ class BargeIn(BaseModel):
     type: Literal["barge_in"]
 
 
+class NeedAudio(BaseModel):
+    """Sound turned on in a case that started without it: voice these lines, and every line from now on.
+
+    line_seqs: the line playing in the browser and those waiting in its buffer. after: the last
+    seq the browser had, so lines already on their way are voiced too.
+    """
+
+    type: Literal["need_audio"]
+    line_seqs: list[int] = []
+    after: int = 0
+
+
 ClientMessage = TypeAdapter(
-    Annotated[Start | Listen | UserText | Command | Answer | Stop | BargeIn, Field(discriminator="type")]
+    Annotated[Start | Listen | UserText | Command | Answer | Stop | BargeIn | NeedAudio, Field(discriminator="type")]
 )
 
 
@@ -312,13 +324,17 @@ async def _run_and_ring(orchestrator: Orchestrator) -> None:
 
 
 async def run_case(
-    record: CaseRecord, bus: AudioBus, orchestrator: Orchestrator, callback: bool = True
+    record: CaseRecord,
+    bus: AudioBus,
+    orchestrator: Orchestrator,
+    callback: bool = True,
+    usage: guard.CaseUsage | None = None,
 ) -> None:
     """Run the case. A usage limit cancels the orchestrator and sends one limit error.
 
     Be the clinic has no callback (callback=False): the run ends at OFFERS_READY.
     """
-    usage = guard.CaseUsage(record.case.id)
+    usage = usage or guard.CaseUsage(record.case.id)
     with guard.case_usage(usage):
         inner = asyncio.create_task(_run_and_ring(orchestrator) if callback else orchestrator.run())
     usage.on_limit = inner.cancel
@@ -875,11 +891,15 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
     intro: asyncio.Task | None = None  # Watch mode's demo patient and Lana, before the calls
     orchestrator: Orchestrator | None = None
     session: PatientSession | None = None
-    voice = record.voice  # the case's setting; stepping away turns call audio off for a while
+    voice = record.voice  # the case started with sound; need_audio turns it on mid-run
+    away = False  # stepped away: call audio is off for a while
+    run_usage: guard.CaseUsage | None = None  # the run's counters, so late audio is charged to it
+    intro_usage: guard.CaseUsage | None = None  # Watch mode's opening, before the run
+    late_audio: set[asyncio.Task] = set()
 
     async def start_run(preferences: Preferences, keep_listening: bool = False) -> None:
         """The calls: from the start message, "just show me", or the end of the patient's intake."""
-        nonlocal run, orchestrator
+        nonlocal run, orchestrator, run_usage
         if run is not None and not run.done():
             await bus.send_payload({"type": "error", "code": "running", "message": "The case is already running."})
         elif not guard.allow_run(record.runs):
@@ -889,17 +909,18 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
                 session.stop_listening()
             record.runs += 1
             record.case = Case(id=record.case.id, preferences=preferences, mode=record.case.mode)
+            run_usage = guard.CaseUsage(record.case.id)
             if clinic_case:
                 orchestrator = Orchestrator(
                     record.case, clinic_emit, max_clinics=record.clinics, receptionists=receptionists
                 )
-                run = asyncio.create_task(run_case(record, bus, orchestrator, callback=False))
+                run = asyncio.create_task(run_case(record, bus, orchestrator, callback=False, usage=run_usage))
                 if session is not None:
                     # Out of STT seconds: nobody can hear the judge, so the calls stop too.
                     session.usage.on_limit = run.cancel
             else:
                 orchestrator = Orchestrator(record.case, bus.emit, max_clinics=record.clinics)
-                run = asyncio.create_task(run_case(record, bus, orchestrator))
+                run = asyncio.create_task(run_case(record, bus, orchestrator, usage=run_usage))
 
     # ----- Be the clinic -----
 
@@ -951,8 +972,10 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
             return
         await bus.emit(event)
 
-    def set_away(away: bool) -> None:
+    def set_away(now_away: bool) -> None:
         # While stepped away, call lines go out as text only: no TTS spent, and the calls run faster.
+        nonlocal away
+        away = now_away
         record.voice = voice and not away
         if away and orchestrator is not None and run is not None and not run.done():
             orchestrator.stepped_away = True  # her callback says how many calls she made meanwhile
@@ -961,6 +984,20 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
                 session.stop_listening()
             else:
                 session.resume_listening()
+
+    async def need_audio(seqs: list[int], after: int) -> None:
+        """Sound turned on mid-run: every line from now on is voiced, and the ones already sent get audio."""
+        nonlocal voice
+        voice = True
+        record.voice = not away
+        if run is not None and not run.done() and run_usage is not None:
+            usage = run_usage
+        elif session is not None:
+            usage = session.usage
+        else:
+            usage = intro_usage or guard.CaseUsage(record.case.id)
+        with guard.case_usage(usage):
+            await bus.voice_late(seqs, after)
 
     async def step_away() -> None:
         """The patient said "I'll wait": the browser dims to the calm screen."""
@@ -974,7 +1011,8 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
 
     async def watch() -> None:
         """The start message: the demo patient's request and Lana's reply, then the calls."""
-        usage = guard.CaseUsage(record.case.id)
+        nonlocal intro_usage
+        usage = intro_usage = guard.CaseUsage(record.case.id)
         try:
             with guard.case_usage(usage):
                 preferences = await demo_intake(record, bus)
@@ -1000,7 +1038,7 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
             except ValidationError:
                 await bus.send_payload(
                     {"type": "error", "code": "bad_message",
-                     "message": "Send start, listen, user_text, command, answer or stop as JSON."}
+                     "message": "Send start, listen, user_text, command, answer, need_audio or stop as JSON."}
                 )
                 continue
 
@@ -1034,6 +1072,10 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
             elif isinstance(msg, BargeIn):
                 if session is None or not session.barge_in():
                     log.info("case=%s barge-in ignored: Lana isn't talking to the patient", case_id)
+            elif isinstance(msg, NeedAudio):
+                task = asyncio.create_task(need_audio(msg.line_seqs, msg.after))
+                late_audio.add(task)
+                task.add_done_callback(late_audio.discard)
             elif isinstance(msg, Command) and msg.name in ("step_away", "step_back"):
                 set_away(msg.name == "step_away")
             elif isinstance(msg, Stop):
@@ -1051,4 +1093,6 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
             await session.close()
         await _cancel(intro)
         await _cancel(run)
+        for task in list(late_audio):
+            await _cancel(task)
         log.info("case=%s socket closed", case_id)

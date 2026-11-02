@@ -3,6 +3,8 @@
 // unreliable in Safari, and lines arrive faster than they play, so only the first one waits.
 
 let ctx: AudioContext | null = null;
+let master: GainNode | null = null; // everything plays through it, so Sound off is one mute
+let soundOff = false;
 const playing = new Set<AudioBufferSourceNode>();
 
 type AudioContextCtor = typeof AudioContext;
@@ -13,7 +15,19 @@ function context(): AudioContext | null {
     window.AudioContext ?? (window as unknown as { webkitAudioContext?: AudioContextCtor }).webkitAudioContext;
   if (!Ctor) return null;
   ctx = new Ctor();
+  master = ctx.createGain();
+  master.gain.value = soundOff ? 0 : 1;
+  master.connect(ctx.destination);
   return ctx;
+}
+
+/**
+ * The Sound toggle. Lines keep playing silently while it's off, so turning it back on is
+ * heard at once, mid-line. A 15 ms ramp avoids a click.
+ */
+export function setSoundOff(off: boolean): void {
+  soundOff = off;
+  if (ctx && master) master.gain.setTargetAtTime(off ? 0 : 1, ctx.currentTime, 0.015);
 }
 
 /** Call inside a click handler. Browsers block sound until a gesture resumes the context. */
@@ -64,8 +78,11 @@ function decode(c: AudioContext, data: ArrayBuffer): Promise<AudioBuffer> {
   });
 }
 
-/** Decodes and plays one line. Rejects if audio can't play, so the caller falls back to text. */
-export async function playLine(chunks: string[]): Promise<PlayingLine> {
+/**
+ * Decodes and plays one line, `from` a fraction of the way in (late audio picking up a line
+ * already on screen). Rejects if audio can't play, so the caller falls back to text.
+ */
+export async function playLine(chunks: string[], from = 0): Promise<PlayingLine> {
   const c = context();
   if (!c) throw new Error("Web Audio is not available");
   if (c.state !== "running") await c.resume().catch(() => {});
@@ -77,7 +94,8 @@ export async function playLine(chunks: string[]): Promise<PlayingLine> {
   const buffer = await decode(c, data);
   const src = c.createBufferSource();
   src.buffer = buffer;
-  src.connect(c.destination);
+  src.connect(master ?? c.destination);
+  const offset = Math.min(Math.max(from, 0), 1) * buffer.duration;
 
   let done = false;
   const ended = new Promise<void>((resolve) => {
@@ -87,8 +105,8 @@ export async function playLine(chunks: string[]): Promise<PlayingLine> {
       resolve();
     };
   });
-  const startedAt = c.currentTime;
-  src.start(0);
+  const startedAt = c.currentTime - offset; // elapsed() counts from the line's start
+  src.start(0, offset);
   playing.add(src);
 
   return {
@@ -128,7 +146,7 @@ export function startRing(): () => void {
   if (c.state === "suspended") void c.resume().catch(() => {});
   const gain = c.createGain();
   gain.gain.value = 0.12;
-  gain.connect(c.destination);
+  gain.connect(master ?? c.destination);
 
   const chime = () => {
     if (c.state !== "running") return;

@@ -31,7 +31,7 @@ export default function App() {
   const [clinics, setClinics] = useStoredState<2 | 3>("lana.clinics", 2);
   const [welcome, setWelcome] = useState(true);
   const { state, listen, start, listenTo, sendText, sendAudio, micLevel, stop, away, stepAway, stepBack, answer } =
-    useCaseRun(startOver, () => void startClinic(true));
+    useCaseRun(startOver, () => void startClinic(true), voice);
 
   async function startWatch() {
     if (busy) return;
@@ -146,6 +146,7 @@ export default function App() {
                   status={statusLine(state)}
                   live={isLive(state)}
                   action={view === "done" ? { label: "Start over", onClick: startOver } : { label: "Stop", onClick: startOver }}
+                  sound={view === "done" ? undefined : { on: voice, set: setVoice }}
                 />
                 <div className="grid flex-1 *:[grid-area:1/1]">
                   <AnimatePresence initial={false}>

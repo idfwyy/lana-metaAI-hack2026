@@ -10,12 +10,15 @@ its audio in the patient voice. The real patient's own words (UserSaid via emit)
 
 cut() stops the line being voiced when the patient talks over Lana: no more of its chunks go
 out, and its last frame says cut: true.
+
+Lines sent without audio because voice was off are kept. If the viewer turns sound on later,
+voice_late() voices them from that text, as frames marked late: true that point back to them.
 """
 
 import asyncio
 import base64
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 
 from pydantic import BaseModel
 
@@ -40,6 +43,7 @@ class AudioBus:
         self._clinics: dict[str, Clinic] = {c.id: c for c in get_public_clinics()}
         self._call_clinic: dict[str, str] = {}
         self._cut = False  # the line being voiced was talked over
+        self._unvoiced: dict[int, AgentSaid | TranscriptFinal | UserSaid] = {}  # sent while voice was off, by seq
 
     def cut(self) -> None:
         """The patient talked over Lana: the line in progress sends no more audio."""
@@ -76,12 +80,32 @@ class AudioBus:
         async with self._lock:
             await self._line(event)
 
-    def _voice(self, event: AgentSaid | TranscriptFinal | UserSaid) -> tuple[Speaker, str | None]:
+    async def voice_late(self, seqs: Iterable[int], after: int) -> None:
+        """Sound turned on mid-run: voice the lines that went out as text only, in seq order.
+
+        That is the lines the browser asked for (`seqs`) and any sent after `after`, the last
+        seq the browser had when it asked: those were in flight and it couldn't know of them.
+        Lines sent from now on follow record.voice, so a step away later stays text only.
+        """
+        wanted = set(seqs)
+        upto = self.record.seq
+        while not guard.limit_hit():
+            pending = sorted(s for s in self._unvoiced if s in wanted or after < s <= upto)
+            if not pending:
+                return
+            async with self._lock:
+                event = self._unvoiced.pop(pending[0], None)
+                if event is None:
+                    continue  # another request voiced it meanwhile
+                speaker, voice_id = self._voice(event, force=True)
+                await self._audio(pending[0], speaker, voice_id, event.text, late=True)
+
+    def _voice(self, event: AgentSaid | TranscriptFinal | UserSaid, force: bool = False) -> tuple[Speaker, str | None]:
         if isinstance(event, UserSaid):
             speaker = Speaker.PATIENT
         else:
             speaker = Speaker.AGENT if isinstance(event, AgentSaid) else event.speaker
-        if not self.record.voice:
+        if not self.record.voice and not force:
             return speaker, None
         try:
             if speaker in (Speaker.AGENT, Speaker.PATIENT):
@@ -99,14 +123,22 @@ class AudioBus:
         self._cut = False
         line_seq = await self._send(shown)
         speaker, voice_id = self._voice(event)
+        if not self.record.voice:
+            self._unvoiced[line_seq] = event
+        await self._audio(line_seq, speaker, voice_id, event.text)
+
+    async def _audio(self, line_seq: int, speaker: Speaker, voice_id: str | None, text: str, late: bool = False) -> None:
+        """One line's audio frames, or a single failed marker. A late line can't be talked over."""
         audio = {"type": "audio", "line_seq": line_seq, "speaker": speaker.value}
+        if late:
+            audio["late"] = True
 
         # Each chunk waits for the next, so the final one can carry last: true.
         held: bytes | None = None
         if voice_id is not None:
             try:
-                async for chunk in stream_speech(event.text, voice_id, speaker=speaker):
-                    if self._cut:
+                async for chunk in stream_speech(text, voice_id, speaker=speaker):
+                    if self._cut and not late:
                         break
                     if held is not None:
                         await self._send({**audio, "chunk_b64": base64.b64encode(held).decode("ascii"), "last": False})
@@ -118,7 +150,7 @@ class AudioBus:
                     log.warning("case=%s tts failed mid-line: %s: %s", self.record.case.id, type(err).__name__, err)
         if guard.limit_hit():
             return
-        if self._cut:
+        if self._cut and not late:
             # The browser already stopped this line; it shows the text without its audio.
             await self._send({**audio, "last": True, "failed": True, "cut": True})
         elif held is not None:

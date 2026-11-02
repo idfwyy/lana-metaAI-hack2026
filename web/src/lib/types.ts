@@ -246,6 +246,8 @@ export interface AudioFrame extends Base {
   failed?: boolean;
   /** The patient talked over this line; the rest of its audio never came. */
   cut?: boolean;
+  /** Voiced after sound came on (need_audio): replaces the line's earlier failed marker. */
+  late?: boolean;
 }
 
 export type ServerEvent =
@@ -291,4 +293,9 @@ export type ClientMessage =
   /** Pick up Lana's callback (auto after 3 s of ringing). */
   | { type: "answer" }
   /** The patient started talking over Lana; her audio is already stopped here. */
-  | { type: "barge_in" };
+  | { type: "barge_in" }
+  /**
+   * Sound came on in a case that started without it: voice these lines (the one on screen and
+   * the buffered ones) and every line after `after`, the last seq received; then voice all lines.
+   */
+  | { type: "need_audio"; line_seqs: number[]; after: number };

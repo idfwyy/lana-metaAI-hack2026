@@ -4,9 +4,12 @@
 // streams to the server, and the listen state below drives Home through intake. When intake
 // is done the calls start and the mic stays open for "I'll wait". At the end Lana calls back:
 // answer() picks up, and the listen state drives the callback's captions.
+// Sound is a mute in the browser. A case that started without sound has no audio to unmute,
+// so the first sound on asks the server for it (need_audio); from then on the case is voiced.
 
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { toast } from "sonner";
+import { setSoundOff } from "./audio";
 import { startMic, type Mic } from "./mic";
 import { Player } from "./player";
 import { CaseSocket } from "./socket";
@@ -116,6 +119,8 @@ export function useCaseRun(
   onStartOver?: () => void,
   /** The patient said "let me be the clinic": the app starts a new clinic case. */
   onClinic?: () => void,
+  /** The Sound toggle: the single source of truth. A change applies to the run in progress at once. */
+  sound = true,
 ): {
   state: RunState;
   listen: ListenState;
@@ -145,6 +150,10 @@ export function useCaseRun(
   startOver.current = onStartOver;
   const clinicStart = useRef(onClinic);
   clinicStart.current = onClinic;
+  const soundOn = useRef(sound);
+  soundOn.current = sound;
+  /** The server voices this case's lines: it started with sound, or need_audio was sent. */
+  const voiced = useRef(sound);
   /** Be the clinic: this case's judge, their call ids, and whether their mic must stay quiet (on hold or call over). */
   const clinicCase = useRef(false);
   const judgeCalls = useRef(new Set<string>());
@@ -225,6 +234,7 @@ export function useCaseRun(
         },
         bargeable: (callId) => clinicCase.current && !judgeQuiet.current && judgeCalls.current.has(callId),
       });
+      voiced.current = soundOn.current; // the case was just created with this value
       const s = new CaseSocket(
         caseId,
         {
@@ -348,6 +358,15 @@ export function useCaseRun(
       stopMic();
     }
   }, [finished, stopMic]);
+
+  // Sound flipped: mute or unmute at once. The first sound on in an unvoiced case asks for audio.
+  useEffect(() => {
+    setSoundOff(!sound);
+    if (!sound || voiced.current || !socket.current || !player.current) return;
+    const { lineSeqs, after } = player.current.needAudio();
+    socket.current.send({ type: "need_audio", line_seqs: lineSeqs, after });
+    voiced.current = true;
+  }, [sound]);
 
   useEffect(() => stop, [stop]);
 
