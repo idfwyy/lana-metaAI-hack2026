@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { ChevronDown } from "lucide-react";
 import { EASE_DRAWER } from "../lib/motion";
@@ -11,67 +11,45 @@ interface Props {
   setVoice: (v: boolean) => void;
   clinics: 2 | 3;
   setClinics: (n: 2 | 3) => void;
+  /** Opens the welcome card again. */
+  onHowItWorks: () => void;
 }
 
-export function DemoFooter({ voice, setVoice, clinics, setClinics }: Props) {
+export function DemoFooter({ voice, setVoice, clinics, setClinics, onHowItWorks }: Props) {
   const [open, setOpen] = useState(false);
 
   return (
     <footer className="border-t border-hairline px-4 py-4 sm:px-8">
       <div className="mx-auto flex max-w-[1120px] flex-wrap items-center justify-between gap-x-6 gap-y-3">
-        <button
-          type="button"
-          onClick={() => setOpen((o) => !o)}
-          aria-expanded={open}
-          aria-controls="about-demo"
-          className="pressable inline-flex items-center gap-1.5 rounded-md text-[13px] text-muted hover:text-ink"
-        >
-          About this demo
-          <ChevronDown
-            size={14}
-            aria-hidden
-            className="transition-transform duration-200 ease-[var(--ease-out)]"
-            style={{ transform: open ? "rotate(180deg)" : "none" }}
-          />
-        </button>
+        <div className="flex items-center gap-5">
+          <button
+            type="button"
+            onClick={() => setOpen((o) => !o)}
+            aria-expanded={open}
+            aria-controls="about-demo"
+            className="pressable inline-flex items-center gap-1.5 rounded-md text-[13px] text-muted hover:text-ink"
+          >
+            About this demo
+            <ChevronDown
+              size={14}
+              aria-hidden
+              className="transition-transform duration-200 ease-[var(--ease-out)]"
+              style={{ transform: open ? "rotate(180deg)" : "none" }}
+            />
+          </button>
+          <button
+            type="button"
+            onClick={onHowItWorks}
+            aria-haspopup="dialog"
+            className="pressable rounded-md text-[13px] text-muted hover:text-ink"
+          >
+            How it works
+          </button>
+        </div>
 
         <div className="flex items-center gap-5 text-[13px] text-muted">
-          <label className="inline-flex cursor-pointer items-center gap-2">
-            Voice
-            <button
-              type="button"
-              role="switch"
-              aria-checked={voice}
-              onClick={() => setVoice(!voice)}
-              className={`relative h-5 w-9 rounded-full transition-colors duration-200 ${voice ? "bg-primary" : "bg-hairline"}`}
-            >
-              <span
-                className="absolute left-0.5 top-0.5 size-4 rounded-full bg-surface shadow-sm transition-transform duration-200 ease-[var(--ease-out)]"
-                style={{ transform: voice ? "translateX(16px)" : "none" }}
-              />
-            </button>
-            <span className="w-6 text-ink">{voice ? "on" : "off"}</span>
-          </label>
-
-          <div className="inline-flex items-center gap-2">
-            <span id="clinics-label">Clinics</span>
-            <div role="radiogroup" aria-labelledby="clinics-label" className="inline-flex rounded-full border border-hairline p-0.5">
-              {([2, 3] as const).map((n) => (
-                <button
-                  key={n}
-                  type="button"
-                  role="radio"
-                  aria-checked={clinics === n}
-                  onClick={() => setClinics(n)}
-                  className={`h-6 w-8 rounded-full font-mono text-[12px] transition-colors duration-150 ${
-                    clinics === n ? "bg-primary-soft text-primary" : "text-muted hover:text-ink"
-                  }`}
-                >
-                  {n}
-                </button>
-              ))}
-            </div>
-          </div>
+          <SoundSwitch voice={voice} setVoice={setVoice} />
+          <ClinicsPicker clinics={clinics} setClinics={setClinics} />
         </div>
       </div>
 
@@ -96,5 +74,53 @@ export function DemoFooter({ voice, setVoice, clinics, setClinics }: Props) {
         )}
       </AnimatePresence>
     </footer>
+  );
+}
+
+/** Lana speaks out loud, or text only. Shared by the footer and the welcome card. */
+export function SoundSwitch({ voice, setVoice }: { voice: boolean; setVoice: (v: boolean) => void }) {
+  return (
+    <label className="inline-flex cursor-pointer items-center gap-2">
+      Sound
+      <button
+        type="button"
+        role="switch"
+        aria-checked={voice}
+        onClick={() => setVoice(!voice)}
+        className={`relative h-5 w-9 rounded-full transition-colors duration-200 ${voice ? "bg-primary" : "bg-hairline"}`}
+      >
+        <span
+          className="absolute left-0.5 top-0.5 size-4 rounded-full bg-surface shadow-sm transition-transform duration-200 ease-[var(--ease-out)]"
+          style={{ transform: voice ? "translateX(16px)" : "none" }}
+        />
+      </button>
+      <span className="w-6 text-ink">{voice ? "on" : "off"}</span>
+    </label>
+  );
+}
+
+/** How many demo clinics Lana calls. Shared by the footer and the welcome card. */
+export function ClinicsPicker({ clinics, setClinics }: { clinics: 2 | 3; setClinics: (n: 2 | 3) => void }) {
+  const labelId = useId();
+  return (
+    <div className="inline-flex items-center gap-2">
+      <span id={labelId}>Clinics</span>
+      <div role="radiogroup" aria-labelledby={labelId} className="inline-flex rounded-full border border-hairline p-0.5">
+        {([2, 3] as const).map((n) => (
+          <button
+            key={n}
+            type="button"
+            role="radio"
+            aria-checked={clinics === n}
+            onClick={() => setClinics(n)}
+            className={`h-6 w-8 rounded-full font-mono text-[12px] transition-colors duration-150 ${
+              clinics === n ? "bg-primary-soft text-primary" : "text-muted hover:text-ink"
+            }`}
+          >
+            {n}
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }

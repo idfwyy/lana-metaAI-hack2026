@@ -3,11 +3,13 @@
 // A patient case stays on Home through intake and moves on when its calls start. Both modes
 // end with Lana calling back; Done shows once the patient books or saves. Be the clinic
 // stays on Home for the briefing and goes straight to Done once the offers are in.
+// Every page load opens the welcome card over Home; the footer's "How it works" opens it again.
 
 import { useState } from "react";
 import { AnimatePresence, LayoutGroup, MotionConfig, motion } from "motion/react";
 import { Toaster, toast } from "sonner";
 import { TopBar } from "./components/TopBar";
+import { WelcomeCard } from "./components/WelcomeCard";
 import { createCase } from "./lib/api";
 import { unlockAudio } from "./lib/audio";
 import { useStoredState } from "./lib/hooks";
@@ -27,6 +29,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [voice, setVoice] = useStoredState("lana.voice", true);
   const [clinics, setClinics] = useStoredState<2 | 3>("lana.clinics", 2);
+  const [welcome, setWelcome] = useState(true);
   const { state, listen, start, listenTo, sendText, sendAudio, micLevel, stop, away, stepAway, stepBack, answer } =
     useCaseRun(startOver, () => void startClinic(true));
 
@@ -110,12 +113,14 @@ export default function App() {
             ? "callback"
             : "working";
   const lana = [...state.lines].reverse().find((l) => l.callId === null) ?? null;
+  // Only over an idle Home: a start button begins a run, and the card gets out of the way.
+  const welcoming = welcome && view === "home" && !running && !busy;
 
   return (
     <MotionConfig reducedMotion="user">
       <LayoutGroup>
         {/* Screens share one grid cell, so the outgoing one overlaps the incoming one. */}
-        <div className="grid min-h-dvh *:[grid-area:1/1]">
+        <div className="grid min-h-dvh *:[grid-area:1/1]" inert={welcoming || undefined}>
           <AnimatePresence initial={false}>
             {view === "home" && (
               <Home
@@ -132,6 +137,7 @@ export default function App() {
                 setVoice={setVoice}
                 clinics={clinics}
                 setClinics={setClinics}
+                onHowItWorks={() => setWelcome(true)}
               />
             )}
             {(view === "working" || view === "callback" || view === "done") && (
@@ -199,6 +205,22 @@ export default function App() {
           </AnimatePresence>
         </div>
       </LayoutGroup>
+      <AnimatePresence>
+        {welcoming && (
+          <WelcomeCard
+            key="welcome"
+            busy={busy}
+            onTalk={startPatient}
+            onWatch={startWatch}
+            onClinic={() => void startClinic()}
+            onClose={() => setWelcome(false)}
+            voice={voice}
+            setVoice={setVoice}
+            clinics={clinics}
+            setClinics={setClinics}
+          />
+        )}
+      </AnimatePresence>
       <Toaster
         position="bottom-center"
         toastOptions={{

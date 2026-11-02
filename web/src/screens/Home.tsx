@@ -28,6 +28,8 @@ interface Props {
   setVoice: (v: boolean) => void;
   clinics: 2 | 3;
   setClinics: (n: 2 | 3) => void;
+  /** The footer's "How it works": opens the welcome card again. */
+  onHowItWorks: () => void;
 }
 
 /** Everything but the mic leaves quickly, so the mic is alone on stage as it flies up. */
@@ -36,7 +38,7 @@ const leave = {
   transition: { duration: 0.16, ease: EASE_OUT },
 };
 
-export function Home({ busy, onMic, onStart, onClinic, listen, lana, onSay, micLevel, voice, setVoice, clinics, setClinics }: Props) {
+export function Home({ busy, onMic, onStart, onClinic, listen, lana, onSay, micLevel, voice, setVoice, clinics, setClinics, onHowItWorks }: Props) {
   const active = listen.active;
   // Be the clinic's briefing: Lana explains the role, the card shows the prices, the judge says ready.
   const briefing = active && listen.clinic;
@@ -140,7 +142,13 @@ export function Home({ busy, onMic, onStart, onClinic, listen, lana, onSay, micL
       </main>
 
       <motion.div {...leave}>
-        <DemoFooter voice={voice} setVoice={setVoice} clinics={clinics} setClinics={setClinics} />
+        <DemoFooter
+          voice={voice}
+          setVoice={setVoice}
+          clinics={clinics}
+          setClinics={setClinics}
+          onHowItWorks={onHowItWorks}
+        />
       </motion.div>
     </motion.div>
   );
