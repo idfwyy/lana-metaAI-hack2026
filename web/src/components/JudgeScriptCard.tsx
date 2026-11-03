@@ -1,13 +1,14 @@
 // Be the clinic: the judge's script. Parkway's price sheet in plain words, what to say for the
 // question Lana just asked, and whose turn it is. The judge can go off script; Lana listens.
 //
-// The prices mirror Parkway's sheet in backend/app/data/demo_clinics.json. Only the judge sees
-// them: Lana never does.
+// The facts come from GET /config/judge-sheet (Parkway's sheet in backend/app/data/demo_clinics.json),
+// with a copy here in case the server can't be reached. Only the judge sees them: Lana never does.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { Mic, Pause } from "lucide-react";
-import { clock } from "../lib/format";
+import { fetchJudgeSheet, type JudgeSheet } from "../lib/api";
+import { clock, money } from "../lib/format";
 import { useNow } from "../lib/hooks";
 import { EASE_OUT } from "../lib/motion";
 import type { JudgeView, Line } from "../lib/state";
@@ -17,35 +18,93 @@ import { TypeBox } from "../screens/Home";
 import { FlashCard } from "./FlashCard";
 import { LiveCaptions } from "./LiveCaptions";
 
-const QUOTE = [
-  ["Treatment", "$4,800"],
-  ["Records fee", "$250, for x-rays and scans"],
-  ["Monthly plan", "$180 a month, $1,000 down"],
-  ["Evening openings", "Tue 5:30 PM, Thu 6:00 PM"],
-] as const;
-
-const ROOM = [
-  "Lowest you can go: $3,990",
-  "You can match a competitor's price",
-  "You can waive the records fee",
-  "5% off for paying in full",
-  "You can add a second set of retainers",
-];
-
-const SUGGESTIONS: Record<JudgePhase, string[]> = {
-  greeting: ["Parkway Orthodontics, how can I help?", "Hi, this is Parkway. What can I do for you?"],
-  price: ["Our total is $4,800, plus a $250 records fee.", "Braces are $4,800 for the full treatment."],
-  fees: ["Yes, the records fee is $250, on top of the $4,800.", "There's a $250 fee for x-rays and scans."],
-  monthly: ["It's $180 a month with $1,000 down.", "We do $1,000 down, then $180 a month."],
-  opening: ["We have Tuesday at 5:30 PM or Thursday at 6.", "Our next evening opening is Tuesday at 5:30."],
-  hold: ["Sure, I'll hold.", "No problem."],
-  negotiation: [
-    "Let me check with my manager... yes, we can match that.",
-    "Sorry, we can't go that low.",
-    "Which clinic was that?",
-  ],
-  wrap: ["Thanks, bye!", "Have a great day."],
+/** Used only when the server can't be reached. */
+const FALLBACK_SHEET: JudgeSheet = {
+  clinic_name: "Parkway Orthodontics",
+  treatment: 4800,
+  records_fee: 250,
+  monthly: 180,
+  down_payment: 1000,
+  evening_openings: ["Tue 5:30 PM", "Thu 6:00 PM"],
+  lowest_price: 3990,
+  can_match_price: true,
+  can_waive_records: true,
+  pay_in_full_discount_pct: 5,
+  can_add_retainers: true,
 };
+
+const DAYS: Record<string, string> = {
+  Mon: "Monday", Tue: "Tuesday", Wed: "Wednesday", Thu: "Thursday", Fri: "Friday", Sat: "Saturday", Sun: "Sunday",
+};
+
+/** "Thu 6:00 PM" -> "Thursday at 6 PM" */
+function spokenOpening(slot: string): string {
+  const [day, ...time] = slot.split(" ");
+  return `${DAYS[day] ?? day} at ${time.join(" ").replace(":00", "")}`;
+}
+
+function quoteOf(s: JudgeSheet): [string, string][] {
+  return [
+    ["Treatment", money(s.treatment)],
+    ["Records fee", `${money(s.records_fee)}, for x-rays and scans`],
+    ["Monthly plan", `${money(s.monthly)} a month, ${money(s.down_payment)} down`],
+    ["Evening openings", s.evening_openings.join(", ") || "None this week"],
+  ];
+}
+
+function roomOf(s: JudgeSheet): string[] {
+  return [
+    `Lowest you can go: ${money(s.lowest_price)}`,
+    ...(s.can_match_price ? ["You can match a competitor's price"] : []),
+    ...(s.can_waive_records ? ["You can waive the records fee"] : []),
+    ...(s.pay_in_full_discount_pct > 0 ? [`${s.pay_in_full_discount_pct}% off for paying in full`] : []),
+    ...(s.can_add_retainers ? ["You can add a second set of retainers"] : []),
+  ];
+}
+
+function suggestionsOf(s: JudgeSheet): Record<JudgePhase, string[]> {
+  const [first, second] = s.evening_openings.map(spokenOpening);
+  return {
+    greeting: ["Parkway Orthodontics, how can I help?", "Hi, this is Parkway. What can I do for you?"],
+    price: [
+      `Our total is ${money(s.treatment)}, plus a ${money(s.records_fee)} records fee.`,
+      `Braces are ${money(s.treatment)} for the full treatment.`,
+    ],
+    fees: [
+      `Yes, the records fee is ${money(s.records_fee)}, on top of the ${money(s.treatment)}.`,
+      `There's a ${money(s.records_fee)} fee for x-rays and scans.`,
+    ],
+    monthly: [
+      `It's ${money(s.monthly)} a month with ${money(s.down_payment)} down.`,
+      `We do ${money(s.down_payment)} down, then ${money(s.monthly)} a month.`,
+    ],
+    opening: first
+      ? [second ? `We have ${first} or ${second}.` : `We have ${first}.`, `Our next evening opening is ${first}.`]
+      : ["We don't have evening openings this week."],
+    hold: ["Sure, I'll hold.", "No problem."],
+    negotiation: [
+      "Let me check with my manager... yes, we can match that.",
+      "Sorry, we can't go that low.",
+      "Which clinic was that?",
+    ],
+    wrap: ["Thanks, bye!", "Have a great day."],
+  };
+}
+
+/** The server's sheet once it loads; the copy above until then (or if it never does). */
+function useJudgeSheet(): JudgeSheet {
+  const [sheet, setSheet] = useState(FALLBACK_SHEET);
+  useEffect(() => {
+    let live = true;
+    void fetchJudgeSheet().then((s) => {
+      if (live && s) setSheet(s);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+  return sheet;
+}
 
 interface Props {
   /** The briefing on Home: just the price sheet, before the call. */
@@ -69,6 +128,7 @@ function turnOf(judge: JudgeView | null, listen: ListenState | undefined): Turn 
 }
 
 export function JudgeScriptCard({ compact = false, judge = null, lana = null, listen, micLevel, onSay }: Props) {
+  const sheet = useJudgeSheet();
   const turn = turnOf(judge, listen);
   const phase: JudgePhase = judge?.phase ?? "greeting";
   const fallback = !!listen?.fallback;
@@ -81,12 +141,12 @@ export function JudgeScriptCard({ compact = false, judge = null, lana = null, li
       className="w-full max-w-[460px] rounded-[20px] border border-hairline bg-surface p-5 text-left shadow-soft"
     >
       <h2 className="font-serif text-[26px] font-normal leading-[1.1] tracking-[-0.01em] text-ink">
-        You're Parkway Orthodontics
+        You're {sheet.clinic_name}
       </h2>
       {!compact && <TurnState turn={turn} judge={judge} micLevel={micLevel} />}
 
       <dl className="mt-4 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1.5 text-[14px]">
-        {QUOTE.map(([term, value]) => (
+        {quoteOf(sheet).map(([term, value]) => (
           <div key={term} className="contents">
             <dt className="text-muted">{term}</dt>
             <dd className="text-ink tnum">{value}</dd>
@@ -94,7 +154,7 @@ export function JudgeScriptCard({ compact = false, judge = null, lana = null, li
         ))}
       </dl>
       <ul className="mt-3 flex flex-col gap-1 border-t border-hairline pt-3 text-[14px] text-ink">
-        {ROOM.map((item) => (
+        {roomOf(sheet).map((item) => (
           <li key={item}>{item}</li>
         ))}
       </ul>
@@ -104,7 +164,7 @@ export function JudgeScriptCard({ compact = false, judge = null, lana = null, li
           <FlashCard
             bare
             label={turn === "ended" ? "TO SIGN OFF" : "YOU COULD SAY"}
-            phrases={SUGGESTIONS[phase]}
+            phrases={suggestionsOf(sheet)[phase]}
             onPick={fallback && canAnswer && onSay ? onSay : undefined}
           />
         </div>

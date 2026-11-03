@@ -108,6 +108,15 @@ def charge_stt(seconds: float) -> None:
     usage.stt_seconds += seconds
 
 
+def client_ip(forwarded_for: str | None, peer: str | None) -> str:
+    """The visitor's IP: the first X-Forwarded-For entry (set by Railway's proxy), else the socket address.
+
+    A client can send its own X-Forwarded-For, which is fine for a soft demo limit.
+    """
+    first = (forwarded_for or "").split(",")[0].strip()
+    return first or peer or "unknown"
+
+
 def allow_new_case(ip: str) -> bool:
     """True (and counted) if this IP has created fewer than MAX_CASES_PER_IP_HOUR cases in the last hour."""
     now = time.monotonic()

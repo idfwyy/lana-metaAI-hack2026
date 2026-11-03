@@ -40,7 +40,7 @@ from app.agent.orchestrator import Orchestrator, Say, pick_slot, simulated, spok
 from app.cli import DEMO_PREFERENCES
 from app.clinics.judge_line import CALL_BACK_LATER, DIDNT_CATCH, JUDGE_CLINIC_ID, JudgeLine
 from app.config import get_settings
-from app.data.loader import get_public_clinics
+from app.data.loader import get_public_clinics, load_demo_clinics
 from app.db.store import CaseRecord, store
 from app.integrations import meta_llm
 from app.schemas.case import Case
@@ -66,6 +66,9 @@ log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 LIMIT_ERROR = {"type": "error", "code": "limit", "message": guard.LIMIT_MESSAGE}
+# What the browser gets for anything unexpected; the details go to the server log only.
+SERVER_ERROR_MESSAGE = "Something went wrong. Please try again."
+SERVER_ERROR = {"type": "error", "code": "server_error", "message": SERVER_ERROR_MESSAGE}
 
 # Lana's fixed lines to the patient. The full disclaimer stays in "About this demo".
 GREETING = (
@@ -180,6 +183,7 @@ async def _prewarm_lines() -> None:
     """
     if not get_settings().elevenlabs_api_key.get_secret_value():
         return
+    started = time.perf_counter()
     intake_lines = Intake()._lines
     lana = [
         _greeting(), *FIXED_LINES,
@@ -201,6 +205,14 @@ async def _prewarm_lines() -> None:
             return
         summary = ", ".join(f"{r} {results.count(r)}" for r in sorted(set(results)))
         log.info("TTS prewarm (%s): %s", speaker.value, summary)
+    # On Railway the disk is temporary, so this rebuilds the cache after every deploy.
+    log.info("TTS prewarm took %.1fs", time.perf_counter() - started)
+
+
+async def _warm_start() -> None:
+    """Voice warm-up, then the prewarm. Runs in the background so startup never waits on ElevenLabs."""
+    await _warm_up_voices()
+    await _prewarm_lines()
 
 
 async def _cancel(task: asyncio.Task | None) -> None:
@@ -213,27 +225,70 @@ async def _cancel(task: asyncio.Task | None) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    if not settings.meta_api_key.get_secret_value() or not settings.meta_base_url:
-        log.warning("META_API_KEY or META_BASE_URL is blank; cases will fail at the first AI call")
+    missing = settings.missing_keys()
+    if missing:
+        log.error("Missing %s: set them in the environment. /health reports ok: false until then.",
+                  ", ".join(missing))
+    if not settings.meta_base_url:
+        log.warning("META_BASE_URL is blank; cases will fail at the first AI call")
     _open_clients()
-    await _warm_up_voices()
-    prewarm = asyncio.create_task(_prewarm_lines())
+    warm = asyncio.create_task(_warm_start())
     yield
-    await _cancel(prewarm)
+    await _cancel(warm)
+
+
+def cors_options(settings) -> dict:
+    """CORSMiddleware options: WEB_ORIGIN's list, plus WEB_ORIGIN_REGEX if set."""
+    return {
+        "allow_origins": settings.web_origins,
+        "allow_origin_regex": settings.web_origin_regex or None,
+        "allow_methods": ["*"],
+        "allow_headers": ["*"],
+    }
 
 
 app = FastAPI(title="Patient Agent", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[get_settings().web_origin],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, **cors_options(get_settings()))
+
+
+@app.exception_handler(Exception)
+async def server_error(request: Request, err: Exception) -> JSONResponse:
+    log.exception("%s %s failed", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"code": "server_error", "message": SERVER_ERROR_MESSAGE})
 
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True}
+    missing = get_settings().missing_keys()
+    return {"ok": not missing, "missing": missing}
+
+
+def _clock_time(slot) -> str:
+    """'Tue 5:30 PM' (no %-I: Windows has no such format)."""
+    hour = slot.hour % 12 or 12
+    return f"{slot:%a} {hour}:{slot:%M} {'AM' if slot.hour < 12 else 'PM'}"
+
+
+@app.get("/config/judge-sheet")
+async def judge_sheet() -> dict:
+    """The facts on the judge's script card in Be the clinic (Parkway's sheet, which the judge plays).
+
+    Only the judge's card reads this; Lana never sees a price sheet.
+    """
+    clinic, sheet = next((c, s) for c, s in load_demo_clinics() if c.id == JUDGE_CLINIC_ID)
+    return {
+        "clinic_name": clinic.name,
+        "treatment": sheet.list_price,
+        "records_fee": sheet.records_fee,
+        "monthly": sheet.monthly,
+        "down_payment": sheet.down_payment,
+        "evening_openings": [_clock_time(s) for s in sheet.open_slots if s.hour >= 17],
+        "lowest_price": sheet.floor_price,
+        "can_match_price": sheet.will_price_match,
+        "can_waive_records": sheet.will_waive_records,
+        "pay_in_full_discount_pct": sheet.pay_in_full_discount_pct,
+        "can_add_retainers": sheet.will_add_retainers,
+    }
 
 
 class CreateCase(BaseModel):
@@ -244,7 +299,7 @@ class CreateCase(BaseModel):
 
 @app.post("/cases")
 async def create_case(body: CreateCase, request: Request):
-    ip = request.client.host if request.client else "unknown"
+    ip = guard.client_ip(request.headers.get("x-forwarded-for"), request.client.host if request.client else None)
     if not guard.allow_new_case(ip):
         return JSONResponse(status_code=429, content={"code": "limit", "message": guard.LIMIT_MESSAGE})
     clinics: int = body.clinics
@@ -343,6 +398,10 @@ async def run_case(
     except asyncio.CancelledError:
         if usage.hit is None or not inner.cancelled():
             raise
+    except Exception:
+        log.exception("case=%s run failed", record.case.id)
+        await bus.send_payload(SERVER_ERROR)
+        return
     if usage.hit is not None:
         await bus.send_payload(LIMIT_ERROR)
     log.info("case=%s run ended: %s (llm calls %d, tts chars %d)",
@@ -868,8 +927,25 @@ class PatientSession:
 # ---------- the socket ----------
 
 
+def origin_allowed(origin: str | None, settings) -> bool:
+    """CORS's rules for the socket (CORS doesn't cover WebSockets): WEB_ORIGIN's list or WEB_ORIGIN_REGEX.
+
+    No Origin header (CLI tools like agent ws-watch; browsers always send one) is allowed.
+    """
+    if origin is None:
+        return True
+    if "*" in settings.web_origins or origin in settings.web_origins:
+        return True
+    return bool(settings.web_origin_regex) and re.fullmatch(settings.web_origin_regex, origin) is not None
+
+
 @app.websocket("/ws/case/{case_id}")
 async def case_socket(websocket: WebSocket, case_id: str) -> None:
+    origin = websocket.headers.get("origin")
+    if not origin_allowed(origin, get_settings()):
+        log.warning("case=%s socket refused: origin %r is not allowed", case_id, origin)
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     record = store.get(case_id)
     if record is None:
@@ -1088,6 +1164,10 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
                 log.info("case=%s ignored %s", case_id, msg.type)
     except WebSocketDisconnect:
         pass
+    except Exception:
+        log.exception("case=%s socket failed", case_id)
+        with contextlib.suppress(Exception):
+            await websocket.send_json(SERVER_ERROR)
     finally:
         if session is not None:
             await session.close()

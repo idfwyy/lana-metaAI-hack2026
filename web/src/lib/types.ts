@@ -181,7 +181,7 @@ export interface ErrorEvent extends Base {
   message: string;
   step?: string | null;
   recoverable?: boolean;
-  code?: "limit" | "not_found" | "bad_message" | "running" | string;
+  code?: "limit" | "not_found" | "bad_message" | "running" | "server_error" | string;
 }
 
 export type TimePref = "morning" | "afternoon" | "evening" | "weekend" | "any";

@@ -97,13 +97,17 @@ class Settings(BaseSettings):
     # App
     database_url: str = "sqlite:///./data/dev.db"
     timezone: str = "America/Chicago"
+    # The web app's origins, comma-separated (e.g. https://lana-health.pages.dev,http://localhost:5173).
     web_origin: str = "http://localhost:5173"
+    # Optional: more origins by regex, e.g. Cloudflare Pages previews https://[a-z0-9-]+\.lana-health\.pages\.dev
+    web_origin_regex: str = ""
     public_base_url: str = ""
 
     # Demo usage limits (app/guard.py). TTS characters count only what is sent to ElevenLabs;
     # STT seconds count only real mic audio sent to Meta (no session is open while Lana talks).
     max_runs_per_case: int = Field(default=2, ge=1)
-    max_cases_per_ip_hour: int = Field(default=5, ge=1)
+    # A judge trying all three modes uses up to 4 cases.
+    max_cases_per_ip_hour: int = Field(default=20, ge=1)
     max_llm_calls_per_case: int = Field(default=60, ge=1)
     max_tts_chars_per_case: int = Field(default=4000, ge=0)
     max_tts_chars_per_day: int = Field(default=30000, ge=0)
@@ -154,6 +158,15 @@ class Settings(BaseSettings):
     @property
     def demo_fields(self) -> frozenset[str]:
         return frozenset(self.demo_checklist.split(","))
+
+    @property
+    def web_origins(self) -> list[str]:
+        return [o.strip().rstrip("/") for o in self.web_origin.split(",") if o.strip()]
+
+    def missing_keys(self) -> list[str]:
+        """Names (never values) of the API keys the server can't work without that are blank."""
+        keys = {"META_API_KEY": self.meta_api_key, "ELEVENLABS_API_KEY": self.elevenlabs_api_key}
+        return [name for name, value in keys.items() if not value.get_secret_value()]
 
     def may_call(self, number: str) -> bool:
         """Real calls only when switched on and the number is on the allow list."""

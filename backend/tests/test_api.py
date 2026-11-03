@@ -7,7 +7,10 @@ import time
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from app import guard, main
 from app.agent import commands as commands_module
@@ -306,8 +309,101 @@ def _audio(messages, line_seq: int) -> list[dict]:
 # ---------- REST ----------
 
 
-def test_health(client) -> None:
-    assert client.get("/health").json() == {"ok": True}
+def test_health(client, monkeypatch) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "meta_api_key", SecretStr("meta-secret"))
+    monkeypatch.setattr(settings, "elevenlabs_api_key", SecretStr("eleven-secret"))
+    assert client.get("/health").json() == {"ok": True, "missing": []}
+
+
+def test_health_names_missing_keys_without_values(client, monkeypatch) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "meta_api_key", SecretStr(""))
+    monkeypatch.setattr(settings, "elevenlabs_api_key", SecretStr("eleven-secret"))
+    response = client.get("/health")
+    assert response.json() == {"ok": False, "missing": ["META_API_KEY"]}
+    monkeypatch.setattr(settings, "elevenlabs_api_key", SecretStr(""))
+    response = client.get("/health")
+    assert response.json() == {"ok": False, "missing": ["META_API_KEY", "ELEVENLABS_API_KEY"]}
+    assert "secret" not in response.text
+
+
+def _cors_app(monkeypatch, origin: str, regex: str = "") -> TestClient:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "web_origin", origin)
+    monkeypatch.setattr(settings, "web_origin_regex", regex)
+    app = FastAPI()
+    app.add_middleware(CORSMiddleware, **main.cors_options(settings))
+    app.get("/health")(main.health)
+    return TestClient(app)
+
+
+def _allowed(client: TestClient, origin: str) -> str | None:
+    response = client.options(
+        "/health", headers={"Origin": origin, "Access-Control-Request-Method": "GET"}
+    )
+    return response.headers.get("access-control-allow-origin")
+
+
+def test_cors_accepts_listed_origins_and_rejects_others(monkeypatch) -> None:
+    client = _cors_app(monkeypatch, "https://lana-health.pages.dev/, http://localhost:5173")
+    assert _allowed(client, "https://lana-health.pages.dev") == "https://lana-health.pages.dev"
+    assert _allowed(client, "http://localhost:5173") == "http://localhost:5173"
+    assert _allowed(client, "https://evil.example") is None
+    assert _allowed(client, "https://abc123.lana-health.pages.dev") is None  # no regex set
+
+
+def test_cors_regex_allows_pages_previews(monkeypatch) -> None:
+    client = _cors_app(monkeypatch, "https://lana-health.pages.dev", r"https://[a-z0-9-]+\.lana-health\.pages\.dev")
+    assert _allowed(client, "https://abc123.lana-health.pages.dev") == "https://abc123.lana-health.pages.dev"
+    assert _allowed(client, "https://abc123.lana-health.pages.dev.evil.example") is None
+    assert _allowed(client, "https://evil.example") is None
+
+
+def test_client_ip_prefers_the_first_forwarded_address() -> None:
+    assert guard.client_ip("1.2.3.4, 10.0.0.1", "10.0.0.9") == "1.2.3.4"
+    assert guard.client_ip(" 1.2.3.4 ", None) == "1.2.3.4"
+    assert guard.client_ip("", "10.0.0.9") == "10.0.0.9"
+    assert guard.client_ip(None, None) == "unknown"
+
+
+def test_ip_limit_uses_x_forwarded_for(client) -> None:
+    first = {"X-Forwarded-For": "1.2.3.4, 10.0.0.1"}
+    for _ in range(get_settings().max_cases_per_ip_hour):
+        assert client.post("/cases", json={"mode": "watch"}, headers=first).status_code == 200
+    assert client.post("/cases", json={"mode": "watch"}, headers=first).status_code == 429
+    # Same proxy, another visitor: their own allowance.
+    other = {"X-Forwarded-For": "5.6.7.8, 10.0.0.1"}
+    assert client.post("/cases", json={"mode": "watch"}, headers=other).status_code == 200
+
+
+def test_judge_sheet_serves_parkways_facts(client) -> None:
+    sheet = client.get("/config/judge-sheet").json()
+    assert sheet == {
+        "clinic_name": "Parkway Orthodontics",
+        "treatment": 4800,
+        "records_fee": 250,
+        "monthly": 180,
+        "down_payment": 1000,
+        "evening_openings": ["Tue 5:30 PM", "Thu 6:00 PM"],
+        "lowest_price": 3990,
+        "can_match_price": True,
+        "can_waive_records": True,
+        "pay_in_full_discount_pct": 5,
+        "can_add_retainers": True,
+    }
+
+
+def test_rest_errors_hide_the_details(world, monkeypatch) -> None:
+    def broken(*args, **kwargs):
+        raise RuntimeError("secret-boom at /srv/app.py")
+
+    monkeypatch.setattr(store, "create", broken)
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        response = client.post("/cases", json={"mode": "watch"})
+    assert response.status_code == 500
+    assert response.json() == {"code": "server_error", "message": main.SERVER_ERROR_MESSAGE}
+    assert "secret-boom" not in response.text
 
 
 def test_post_cases_returns_an_id(client) -> None:
@@ -340,6 +436,50 @@ def test_new_cases_per_ip_are_limited(client) -> None:
 
 
 # ---------- the stream ----------
+
+
+def _socket_origin(client: TestClient, monkeypatch, origin: str | None) -> int | None:
+    """Open a case socket with this Origin. None if accepted, else the close code."""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "web_origin", "https://lana-health.pages.dev,http://localhost:5173")
+    monkeypatch.setattr(settings, "web_origin_regex", r"https://[a-z0-9-]+\.lana-health\.pages\.dev")
+    case_id = _new_case(client)
+    headers = {"origin": origin} if origin is not None else {}
+    try:
+        with client.websocket_connect(f"/ws/case/{case_id}", headers=headers) as ws:
+            ws.send_json({"type": "start"})
+            assert ws.receive_json()["type"]
+    except WebSocketDisconnect as err:
+        return err.code
+    return None
+
+
+def test_socket_accepts_a_listed_origin(client, monkeypatch) -> None:
+    assert _socket_origin(client, monkeypatch, "https://lana-health.pages.dev") is None
+
+
+def test_socket_accepts_a_regex_origin(client, monkeypatch) -> None:
+    assert _socket_origin(client, monkeypatch, "https://abc123.lana-health.pages.dev") is None
+
+
+def test_socket_rejects_other_origins(client, monkeypatch) -> None:
+    assert _socket_origin(client, monkeypatch, "https://evil.example") == 1008
+    assert _socket_origin(client, monkeypatch, "https://abc123.lana-health.pages.dev.evil.example") == 1008
+
+
+def test_socket_without_origin_is_allowed(client, monkeypatch) -> None:
+    assert _socket_origin(client, monkeypatch, None) is None
+
+
+def test_a_failed_run_sends_no_raw_error_text(client, world) -> None:
+    def broken(case_id):
+        raise RuntimeError("secret-boom: Traceback at /srv/app/main.py")
+
+    world.script = broken
+    messages = _run(client)
+    errors = [m for m in messages if m["type"] == "error"]
+    assert [(e["code"], e["message"]) for e in errors] == [("server_error", main.SERVER_ERROR_MESSAGE)]
+    assert not any("secret-boom" in json.dumps(m) for m in messages)
 
 
 def test_events_stream_with_increasing_seq(client, world) -> None:
@@ -959,7 +1099,8 @@ def _second_turn_slow(ws, world, delay: float) -> list[dict]:
 def test_a_slow_reply_speaks_no_filler(client, world) -> None:
     with _listen(client) as ws:
         _greeted(ws)
-        messages = _second_turn_slow(ws, world, 2.0)
+        # Fillers are gone, so there is no threshold to cross: any noticeable delay shows it.
+        messages = _second_turn_slow(ws, world, 0.3)
     kinds = [m["type"] for m in messages if m["type"] != "audio"]
     assert kinds == ["user_said", "intake", "agent_said"]  # only her real reply is spoken
     assert [t for t, _, s in world.spoken if s == Speaker.AGENT][-1] == _question("budget")

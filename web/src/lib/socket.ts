@@ -3,9 +3,14 @@
 // An unexpected close reconnects once (the server cancels the run when a socket drops,
 // so the caller resets and the run starts over). A second close is fatal.
 
+import { API_URL } from "./api";
 import type { ClientMessage, ServerMessage } from "./types";
 
-export const WS_URL = (import.meta.env.VITE_WS_URL as string | undefined) ?? "ws://localhost:8000";
+// Blank VITE_WS_URL: the same host as VITE_API_URL (https -> wss, http -> ws).
+export const WS_URL = ((import.meta.env.VITE_WS_URL as string | undefined) || API_URL.replace(/^http/, "ws")).replace(
+  /\/+$/,
+  "",
+);
 
 export interface CaseSocketHandlers {
   onMessage: (m: ServerMessage) => void;
@@ -27,10 +32,18 @@ export class CaseSocket {
   ) {}
 
   open(): void {
+    if (!WS_URL) {
+      this.handlers.onFatal("This site isn't connected to Lana's server yet.");
+      return;
+    }
+    let opened = false;
     const ws = new WebSocket(`${WS_URL}/ws/case/${encodeURIComponent(this.caseId)}`);
     ws.binaryType = "arraybuffer";
     this.ws = ws;
-    ws.onopen = () => this.send(this.opening);
+    ws.onopen = () => {
+      opened = true;
+      this.send(this.opening);
+    };
     ws.onmessage = (e) => {
       if (typeof e.data !== "string") return;
       let msg: ServerMessage;
@@ -43,7 +56,10 @@ export class CaseSocket {
     };
     ws.onclose = () => {
       if (this.ws !== ws || this.closedByUs || this.finished) return;
-      if (!this.reconnected) {
+      if (!opened) {
+        // Never connected: retrying the run won't help.
+        this.handlers.onFatal("Can't reach Lana's server. Try again in a moment.");
+      } else if (!this.reconnected) {
         this.reconnected = true;
         this.handlers.onRestart();
         this.open();
