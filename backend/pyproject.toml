@@ -21,7 +21,6 @@ dependencies = [
     "typer>=0.12",
     "rich>=13",
     "elevenlabs>=1.0",
-    "twilio>=9.0",
     # Windows ships no IANA time zone database; zoneinfo needs this for TIMEZONE.
     "tzdata>=2024.1",
 ]

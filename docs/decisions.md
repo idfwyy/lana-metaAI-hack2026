@@ -70,8 +70,7 @@ Newest first.
 
 ## 2026-10-31: Cases in memory only, and demo usage limits
 
-- Hackathon build keeps cases in memory only, no database; nothing is stored after the session. Cases expire 30 minutes after their last use (`db/store.py`). No audio or transcripts are written to disk. `DATABASE_URL` is unused for now.
-- Usage limits live in `guard.py`, set by `MAX_RUNS_PER_CASE` (2), `MAX_CASES_PER_IP_HOUR` (5), `MAX_LLM_CALLS_PER_CASE` (60), `MAX_TTS_CHARS_PER_CASE` (4,000) and `MAX_TTS_CHARS_PER_DAY` (30,000). TTS characters count only cache misses, since cached lines cost no credits. Counters are in memory and reset when the server restarts.
+- Hackathon build keeps cases in memory only, no database; nothing is stored after the session. Cases expire 30 minutes after their last use (`db/store.py`). No audio or transcripts are written to disk.- Usage limits live in `guard.py`, set by `MAX_RUNS_PER_CASE` (2), `MAX_CASES_PER_IP_HOUR` (5), `MAX_LLM_CALLS_PER_CASE` (60), `MAX_TTS_CHARS_PER_CASE` (4,000) and `MAX_TTS_CHARS_PER_DAY` (30,000). TTS characters count only cache misses, since cached lines cost no credits. Counters are in memory and reset when the server restarts.
 
 ## 2026-10-31: Muse Voice Transcribe, streaming STT in Endpointing mode (voice/stt.py)
 

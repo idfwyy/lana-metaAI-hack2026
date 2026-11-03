@@ -95,13 +95,11 @@ class Settings(BaseSettings):
     judge_hold_s: float = Field(default=8, gt=0)
 
     # App
-    database_url: str = "sqlite:///./data/dev.db"
     timezone: str = "America/Chicago"
     # The web app's origins, comma-separated (e.g. https://lana-health.pages.dev,http://localhost:5173).
     web_origin: str = "http://localhost:5173"
     # Optional: more origins by regex, e.g. Cloudflare Pages previews https://[a-z0-9-]+\.lana-health\.pages\.dev
     web_origin_regex: str = ""
-    public_base_url: str = ""
 
     # Demo usage limits (app/guard.py). TTS characters count only what is sent to ElevenLabs;
     # STT seconds count only real mic audio sent to Meta (no session is open while Lana talks).
@@ -116,15 +114,6 @@ class Settings(BaseSettings):
     # The checklist fields Lana asks on a call, comma-separated, in agent/extractor.py order.
     # The extractor still fills any other field the clinic mentions.
     demo_checklist: str = "total_price,records_fee,monthly_payment,next_slots"
-
-    # Safety switches
-    enable_real_calls: bool = False
-    allowed_call_numbers: str = Field(default="", description="Comma-separated E.164 numbers")
-
-    # Stretch goal: Twilio
-    twilio_account_sid: str = ""
-    twilio_auth_token: SecretStr = SecretStr("")
-    twilio_number: str = ""
 
     @field_validator("timezone")
     @classmethod
@@ -151,10 +140,6 @@ class Settings(BaseSettings):
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
 
-    @cached_property
-    def allowed_numbers(self) -> frozenset[str]:
-        return frozenset(n.strip() for n in self.allowed_call_numbers.split(",") if n.strip())
-
     @property
     def demo_fields(self) -> frozenset[str]:
         return frozenset(self.demo_checklist.split(","))
@@ -167,10 +152,6 @@ class Settings(BaseSettings):
         """Names (never values) of the API keys the server can't work without that are blank."""
         keys = {"META_API_KEY": self.meta_api_key, "ELEVENLABS_API_KEY": self.elevenlabs_api_key}
         return [name for name, value in keys.items() if not value.get_secret_value()]
-
-    def may_call(self, number: str) -> bool:
-        """Real calls only when switched on and the number is on the allow list."""
-        return self.enable_real_calls and number.strip() in self.allowed_numbers
 
 
 @lru_cache

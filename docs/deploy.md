@@ -31,7 +31,6 @@ domain baked in, then tell the backend the web app's origin.
    | `VOICE_PATIENT` | recommended | the Watch mode patient's voice (blank uses `VOICE_CLINIC_1`) |
    | `WEB_ORIGIN` | yes | `https://lana-health.pages.dev` (set it in step 3 below; you can add it now) |
    | `WEB_ORIGIN_REGEX` | optional | `https://[a-z0-9-]+\.lana-health\.pages\.dev` to allow Pages preview deploys |
-   | `ENABLE_REAL_CALLS` | leave unset | must stay `false` |
    | `CALL_REASONING`, `INTAKE_MODEL`, `INTAKE_REASONING` | optional | as in your `.env` |
    | `ELEVENLABS_MODEL*`, `ELEVENLABS_TAG_AGENT`, `ELEVENLABS_STABILITY`, `ELEVENLABS_SIMILARITY`, `ELEVENLABS_STYLE`, `ELEVENLABS_SPEAKER_BOOST`, `AGENT_NAME` | optional | as in your `.env` |
    | `END_GRACE_MS`, `JUDGE_SILENCE_S`, `JUDGE_HOLD_S`, `DEMO_CHECKLIST`, `TIMEZONE` | optional | as in your `.env` |
