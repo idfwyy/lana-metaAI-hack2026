@@ -12,6 +12,8 @@
   --color-primary-soft: #e3efec;
   --color-accent: #ff8a4c;
   --color-accent-soft: #ffe6d8;
+  /* Error text: a dark warm red that stays readable on white and paper. */
+  --color-danger: #a1301b;
 
   --radius-card: 20px;
   --radius-inner: 16px;

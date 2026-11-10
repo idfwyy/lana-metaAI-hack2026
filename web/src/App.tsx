@@ -4,13 +4,15 @@
 // end with Lana calling back; Done shows once the patient books or saves. Be the clinic
 // stays on Home for the briefing and goes straight to Done once the offers are in.
 // Every page load opens the welcome card over Home; the footer's "How it works" opens it again.
+// Anything that starts a case needs an access pass. Without one, the welcome card shows its code
+// step first (`gate` is the start waiting on it), and a 401 or socket close 4401 brings it back.
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, LayoutGroup, MotionConfig, motion } from "motion/react";
 import { Toaster, toast } from "sonner";
 import { TopBar } from "./components/TopBar";
-import { WelcomeCard } from "./components/WelcomeCard";
-import { createCase } from "./lib/api";
+import { WelcomeCard, type Gate, type StartKind } from "./components/WelcomeCard";
+import { AccessError, clearPass, createCase, fetchAccessRequired, hasValidPass, redeemCode } from "./lib/api";
 import { unlockAudio } from "./lib/audio";
 import { useStoredState } from "./lib/hooks";
 import { startMic } from "./lib/mic";
@@ -30,8 +32,57 @@ export default function App() {
   const [voice, setVoice] = useStoredState("lana.voice", true);
   const [clinics, setClinics] = useStoredState<2 | 3>("lana.clinics", 2);
   const [welcome, setWelcome] = useState(true);
+  const [gate, setGate] = useState<Gate | null>(null);
+  // Whether the server asks for a code at all (off in local dev). Unknown counts as yes.
+  const [accessRequired, setAccessRequired] = useState<boolean | null>(null);
+  const lastStart = useRef<StartKind>("talk");
+  useEffect(() => {
+    void fetchAccessRequired().then(setAccessRequired);
+  }, []);
   const { state, listen, start, listenTo, sendText, sendAudio, micLevel, stop, away, stepAway, stepBack, answer } =
-    useCaseRun(startOver, () => void startClinic(true), voice);
+    useCaseRun(startOver, () => void startClinic(true), voice, accessDenied);
+
+  /** The server turned the pass down (expired, or its code was removed): ask for the code again. */
+  function askForCodeAgain(kind: StartKind) {
+    clearPass();
+    setGate({ start: kind, notice: "Your access has ended. Enter your code to continue." });
+    setWelcome(true);
+  }
+
+  function accessDenied() {
+    stop();
+    setRunning(false);
+    askForCodeAgain(lastStart.current);
+  }
+
+  function runStart(kind: StartKind) {
+    lastStart.current = kind;
+    if (kind === "talk") void startPatient();
+    else if (kind === "watch") void startWatch();
+    else void startClinic();
+  }
+
+  /** A start button was pressed (card, mic or Home link). Asks for the code first if there is no pass. */
+  function pick(kind: StartKind) {
+    if (accessRequired !== false && !hasValidPass()) {
+      lastStart.current = kind;
+      setGate({ start: kind });
+      return;
+    }
+    runStart(kind); // first, so audio unlock and the mic prompt stay inside the click
+    setGate(null);
+    setWelcome(false);
+  }
+
+  /** The code step's Continue. A click or Enter, so audio unlocks here, before the request goes out. */
+  async function submitCode(code: string) {
+    unlockAudio();
+    await redeemCode(code); // throws with the server's message; the card shows it under the input
+    const kind = gate?.start ?? lastStart.current;
+    setGate(null);
+    setWelcome(false);
+    runStart(kind);
+  }
 
   async function startWatch() {
     if (busy) return;
@@ -42,7 +93,8 @@ export default function App() {
       start(id);
       setRunning(true);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Couldn't start. Try again.");
+      if (err instanceof AccessError) askForCodeAgain("watch");
+      else toast.error(err instanceof Error ? err.message : "Couldn't start. Try again.");
     } finally {
       setBusy(false);
     }
@@ -60,7 +112,8 @@ export default function App() {
       setRunning(true);
     } catch (err) {
       void mic.then((m) => m.stop(), () => {});
-      toast.error(err instanceof Error ? err.message : "Couldn't start. Try again.");
+      if (err instanceof AccessError) askForCodeAgain("talk");
+      else toast.error(err instanceof Error ? err.message : "Couldn't start. Try again.");
     } finally {
       setBusy(false);
     }
@@ -81,7 +134,8 @@ export default function App() {
     } catch (err) {
       void mic.then((m) => m.stop(), () => {});
       setRunning(false);
-      toast.error(err instanceof Error ? err.message : "Couldn't start. Try again.");
+      if (err instanceof AccessError) askForCodeAgain("clinic");
+      else toast.error(err instanceof Error ? err.message : "Couldn't start. Try again.");
     } finally {
       setBusy(false);
     }
@@ -114,7 +168,7 @@ export default function App() {
             : "working";
   const lana = [...state.lines].reverse().find((l) => l.callId === null) ?? null;
   // Only over an idle Home: a start button begins a run, and the card gets out of the way.
-  const welcoming = welcome && view === "home" && !running && !busy;
+  const welcoming = (welcome || gate !== null) && view === "home" && !running && !busy;
 
   return (
     <MotionConfig reducedMotion="user">
@@ -126,9 +180,9 @@ export default function App() {
               <Home
                 key="home"
                 busy={busy}
-                onMic={startPatient}
-                onStart={startWatch}
-                onClinic={() => void startClinic()}
+                onMic={() => pick("talk")}
+                onStart={() => pick("watch")}
+                onClinic={() => pick("clinic")}
                 listen={listen}
                 lana={lana}
                 onSay={sendText}
@@ -211,10 +265,17 @@ export default function App() {
           <WelcomeCard
             key="welcome"
             busy={busy}
-            onTalk={startPatient}
-            onWatch={startWatch}
-            onClinic={() => void startClinic()}
-            onClose={() => setWelcome(false)}
+            onPick={pick}
+            gate={gate}
+            onCode={submitCode}
+            onBack={() => {
+              setGate(null);
+              setWelcome(true);
+            }}
+            onClose={() => {
+              setGate(null);
+              setWelcome(false);
+            }}
             voice={voice}
             setVoice={setVoice}
             clinics={clinics}

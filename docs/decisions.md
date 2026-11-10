@@ -2,6 +2,19 @@
 
 Newest first.
 
+## 2026-11-09: Access code gate
+
+The site is public but every feature that spends API credits (Meta, ElevenLabs) needs an access code. The backend enforces it; the web UI is only the friendly part.
+
+- **Settings.** `ACCESS_CODES` (comma-separated, one per person) and `ACCESS_TOKEN_SECRET` come only from the environment. Empty `ACCESS_CODES` turns the gate off for local dev, and the server logs a warning at startup. Codes with no secret fail closed: no pass is issued or accepted, and the server logs an error.
+- **`POST /access {code}`.** Trimmed, case-insensitive, compared against every code with `hmac.compare_digest`. Success returns `{pass, expires_at}`; wrong is 401 "That code didn't work."
+- **Pass.** `payload.signature` (base64url): the payload is `{exp, c}`, signed with HMAC-SHA256 under `ACCESS_TOKEN_SECRET`. It lasts 12 hours. `c` is a short fingerprint of the code it was issued for, checked against the current `ACCESS_CODES` on every use, so removing a code kills its passes at once instead of after 12 hours. No database.
+- **Rate limit.** 5 wrong codes per IP in 10 minutes, then 429 "Too many tries. Try again in a few minutes." until the oldest ages out; a right code is refused too while locked out. In memory per process, like the case limit. The IP is `guard.client_ip`, the first `X-Forwarded-For` entry, which a client can set itself, so this stops a person at a keyboard, not someone rotating headers. Keep codes long and random. Wrong tries are logged with the IP, never the code.
+- **Enforcement.** `POST /cases` needs `Authorization: Bearer <pass>` (401 otherwise, no case created). The WebSocket takes the pass as its first message, `{"type": "auth", "pass": ...}`, within 5 s, or closes with 4401 before any case lookup, model call or voice call. A query parameter was rejected because uvicorn logs the query string, which would put live passes in the Railway logs. `/health` and `/config/judge-sheet` stay open.
+- **`GET /config/access`** returns `{required: bool}` so the web app skips the code step when the gate is off (local dev). It reveals nothing else.
+- **Web.** The welcome card shows an access code step in place of the three options when someone picks one, or taps the mic on Home, without a valid pass. The pass is kept in memory and `sessionStorage` (survives a refresh, not a closed tab). A 401 or a 4401 clears it and shows the step again. "Just explore" still just closes the card.
+- **Not covered.** `agent ws-watch` (the CLI) sends no pass, so it works only against a server with the gate off.
+
 ## 2026-11-01: Be the clinic: a judge plays Parkway by voice
 
 - **Entry.** "Let me be the clinic" during intake (the server sends `command: clinic`) or the quiet "or be the clinic" link creates a new case with `POST /cases {mode: "clinic"}`. It always has 2 clinics and the fixed clinic-mode patient in `demo_patients.json` (`mode: "clinic"`, never picked for Watch): braces, Arlington, under $5,000, evenings, pay in full OK. With those preferences Parkway (evening hours) is called first, then a simulated Sunrise.

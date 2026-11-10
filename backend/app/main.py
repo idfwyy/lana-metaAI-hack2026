@@ -29,9 +29,9 @@ from typing import Annotated, Literal
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
-from app import guard
+from app import access, guard
 from app.agent.commands import Command as SpokenCommand
 from app.agent.commands import match_command, parse_command
 from app.agent.caller import opening_lines
@@ -231,6 +231,11 @@ async def lifespan(app: FastAPI):
                   ", ".join(missing))
     if not settings.meta_base_url:
         log.warning("META_BASE_URL is blank; cases will fail at the first AI call")
+    if not access.enabled():
+        log.warning("ACCESS_CODES is empty: the access gate is OFF and anyone can spend API credits. "
+                    "Fine for local dev; set ACCESS_CODES and ACCESS_TOKEN_SECRET before deploying.")
+    elif access.misconfigured():
+        log.error("ACCESS_CODES is set but ACCESS_TOKEN_SECRET is blank: nobody can get in until it is set.")
     _open_clients()
     warm = asyncio.create_task(_warm_start())
     yield
@@ -261,6 +266,37 @@ async def server_error(request: Request, err: Exception) -> JSONResponse:
 async def health() -> dict:
     missing = get_settings().missing_keys()
     return {"ok": not missing, "missing": missing}
+
+
+@app.get("/config/access")
+async def access_config() -> dict:
+    """Whether the browser must ask for a code before starting a case. Reveals nothing else."""
+    return {"required": access.enabled()}
+
+
+class AccessRequest(BaseModel):
+    code: str = Field(max_length=200)
+
+
+@app.post("/access")
+async def redeem_code(body: AccessRequest, request: Request):
+    """Trade an access code for a signed pass that lasts 12 hours."""
+    ip = _ip(request)
+    if not access.enabled():
+        return JSONResponse(status_code=404, content={"code": "no_gate", "message": "No access code is needed."})
+    if access.misconfigured():
+        log.error("POST /access: ACCESS_TOKEN_SECRET is blank")
+        return JSONResponse(status_code=503, content={"code": "not_set_up", "message": access.NOT_SET_UP_MESSAGE})
+    if not guard.code_tries_left(ip):
+        log.warning("access: %s is locked out after too many wrong codes", ip)
+        return JSONResponse(status_code=429, content={"code": "too_many", "message": access.TOO_MANY_MESSAGE})
+    matched = access.match_code(body.code)
+    if matched is None:
+        guard.note_wrong_code(ip)
+        log.warning("access: wrong code from %s", ip)  # never the code itself
+        return JSONResponse(status_code=401, content={"code": "wrong_code", "message": access.WRONG_CODE_MESSAGE})
+    token, expires_at = access.issue_pass(matched)
+    return {"pass": token, "expires_at": expires_at}
 
 
 def _clock_time(slot) -> str:
@@ -297,9 +333,15 @@ class CreateCase(BaseModel):
     clinics: Literal[2, 3] = 2
 
 
+def _ip(request: Request) -> str:
+    return guard.client_ip(request.headers.get("x-forwarded-for"), request.client.host if request.client else None)
+
+
 @app.post("/cases")
 async def create_case(body: CreateCase, request: Request):
-    ip = guard.client_ip(request.headers.get("x-forwarded-for"), request.client.host if request.client else None)
+    if not access.allows(access.bearer(request.headers.get("authorization"))):
+        return JSONResponse(status_code=401, content={"code": "access_required", "message": access.REQUIRED_MESSAGE})
+    ip = _ip(request)
     if not guard.allow_new_case(ip):
         return JSONResponse(status_code=429, content={"code": "limit", "message": guard.LIMIT_MESSAGE})
     clinics: int = body.clinics
@@ -366,8 +408,20 @@ class NeedAudio(BaseModel):
     after: int = 0
 
 
+class Auth(BaseModel):
+    """The access pass, sent first on the socket (browsers can't set headers on a WebSocket, and a
+    query string would end up in server logs). Ignored once the socket is open."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: Literal["auth"]
+    pass_: str = Field(alias="pass", max_length=2000)
+
+
 ClientMessage = TypeAdapter(
-    Annotated[Start | Listen | UserText | Command | Answer | Stop | BargeIn | NeedAudio, Field(discriminator="type")]
+    Annotated[
+        Start | Listen | UserText | Command | Answer | Stop | BargeIn | NeedAudio | Auth, Field(discriminator="type")
+    ]
 )
 
 
@@ -939,6 +993,31 @@ def origin_allowed(origin: str | None, settings) -> bool:
     return bool(settings.web_origin_regex) and re.fullmatch(settings.web_origin_regex, origin) is not None
 
 
+AUTH_WAIT_S = 5.0  # how long a new socket has to send its pass
+
+
+async def _authorized(websocket: WebSocket) -> bool:
+    """With the gate on, the first message must be {"type": "auth", "pass": ...} with a valid pass.
+
+    Nothing else is read or run before it. On failure the socket closes with 4401.
+    """
+    if not access.enabled():
+        return True
+    token = None
+    try:
+        message = await asyncio.wait_for(websocket.receive(), AUTH_WAIT_S)
+        if message["type"] == "websocket.disconnect":
+            return False
+        auth = ClientMessage.validate_json(message.get("text") or "")
+        token = auth.pass_ if isinstance(auth, Auth) else None
+    except (TimeoutError, ValidationError):
+        pass
+    if access.verify_pass(token):
+        return True
+    await websocket.close(code=4401)
+    return False
+
+
 @app.websocket("/ws/case/{case_id}")
 async def case_socket(websocket: WebSocket, case_id: str) -> None:
     origin = websocket.headers.get("origin")
@@ -947,6 +1026,9 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
         await websocket.close(code=1008)
         return
     await websocket.accept()
+    if not await _authorized(websocket):
+        log.warning("case=%s socket refused: no valid access pass", case_id)
+        return
     record = store.get(case_id)
     if record is None:
         await websocket.send_json(
@@ -1152,6 +1234,8 @@ async def case_socket(websocket: WebSocket, case_id: str) -> None:
                 task = asyncio.create_task(need_audio(msg.line_seqs, msg.after))
                 late_audio.add(task)
                 task.add_done_callback(late_audio.discard)
+            elif isinstance(msg, Auth):
+                pass  # the pass was checked on open
             elif isinstance(msg, Command) and msg.name in ("step_away", "step_back"):
                 set_away(msg.name == "step_away")
             elif isinstance(msg, Stop):

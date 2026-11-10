@@ -20,6 +20,9 @@ log = logging.getLogger(__name__)
 
 LIMIT_MESSAGE = "This demo has a usage limit. Please try again later."
 IP_WINDOW_S = 60 * 60
+# Wrong access codes: this many in this window and the IP is locked out until the oldest ages out.
+CODE_TRIES = 5
+CODE_WINDOW_S = 10 * 60
 
 
 class LimitHit(Exception):
@@ -40,6 +43,7 @@ _usage: ContextVar[CaseUsage | None] = ContextVar("case_usage", default=None)
 _day: date | None = None
 _day_chars = 0
 _ip_cases: dict[str, deque[float]] = {}
+_ip_wrong_codes: dict[str, deque[float]] = {}
 
 
 @contextmanager
@@ -129,12 +133,31 @@ def allow_new_case(ip: str) -> bool:
     return True
 
 
+def code_tries_left(ip: str) -> bool:
+    """False once this IP has entered CODE_TRIES wrong access codes in the last CODE_WINDOW_S."""
+    now = time.monotonic()
+    times = _ip_wrong_codes.get(ip)
+    if times is None:
+        return True
+    while times and now - times[0] > CODE_WINDOW_S:
+        times.popleft()
+    if not times:
+        del _ip_wrong_codes[ip]
+        return True
+    return len(times) < CODE_TRIES
+
+
+def note_wrong_code(ip: str) -> None:
+    _ip_wrong_codes.setdefault(ip, deque()).append(time.monotonic())
+
+
 def allow_run(runs_so_far: int) -> bool:
     return runs_so_far < get_settings().max_runs_per_case
 
 
 def reset() -> None:
-    """Forget the day counter and IP history (tests)."""
+    """Forget the day counter and IP history, cases and wrong codes (tests)."""
     global _day, _day_chars
     _day, _day_chars = None, 0
     _ip_cases.clear()
+    _ip_wrong_codes.clear()

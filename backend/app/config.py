@@ -101,6 +101,13 @@ class Settings(BaseSettings):
     # Optional: more origins by regex, e.g. Cloudflare Pages previews https://[a-z0-9-]+\.lana-health\.pages\.dev
     web_origin_regex: str = ""
 
+    # Access gate (app/access.py). Both come only from the environment; never commit real values.
+    # ACCESS_CODES: comma-separated valid codes, one per person so one can be removed later. Empty
+    # turns the gate off (local dev). ACCESS_TOKEN_SECRET signs the passes; the gate refuses
+    # everyone while codes are set without it.
+    access_codes: SecretStr = SecretStr("")
+    access_token_secret: SecretStr = SecretStr("")
+
     # Demo usage limits (app/guard.py). TTS characters count only what is sent to ElevenLabs;
     # STT seconds count only real mic audio sent to Meta (no session is open while Lana talks).
     max_runs_per_case: int = Field(default=2, ge=1)
@@ -147,6 +154,12 @@ class Settings(BaseSettings):
     @property
     def web_origins(self) -> list[str]:
         return [o.strip().rstrip("/") for o in self.web_origin.split(",") if o.strip()]
+
+    @property
+    def access_code_list(self) -> list[str]:
+        """The valid codes, trimmed and lowercased (codes are not case-sensitive); blanks dropped."""
+        raw = self.access_codes.get_secret_value()
+        return [c for c in (part.strip().lower() for part in raw.split(",")) if c]
 
     def missing_keys(self) -> list[str]:
         """Names (never values) of the API keys the server can't work without that are blank."""

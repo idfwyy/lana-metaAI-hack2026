@@ -2,9 +2,12 @@
 
 import asyncio
 import json
+import logging
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI, WebSocketDisconnect
@@ -12,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from app import guard, main
+from app import access, guard, main
 from app.agent import commands as commands_module
 from app.agent import intake as intake_module
 from app.agent.intake import RETRY_PROMPT, TOPIC_FIELDS, Intake
@@ -262,6 +265,9 @@ def world(monkeypatch) -> World:
     monkeypatch.setattr(commands_module, "call_json", fake_classifier)
     monkeypatch.setattr(audio_bus, "stream_speech", fake_speech)
     monkeypatch.setattr(guard, "charge_stt", charge_stt)
+    # The gate is on for every test; `client` holds a pass, `anon` does not.
+    monkeypatch.setattr(settings, "access_codes", SecretStr(CODES))
+    monkeypatch.setattr(settings, "access_token_secret", SecretStr(SECRET))
     store.clear()
     guard.reset()
     yield w
@@ -269,8 +275,40 @@ def world(monkeypatch) -> World:
     guard.reset()
 
 
+CODES = "alpha-code, Beta-Code"
+SECRET = "test-secret-not-real"
+
+
+class PassClient(TestClient):
+    """A TestClient that holds a valid pass: POSTs carry it, sockets send it as their first message."""
+
+    def __init__(self, app, token: str, **kwargs) -> None:
+        super().__init__(app, headers={"Authorization": f"Bearer {token}"}, **kwargs)
+        self.token = token
+
+    @contextmanager
+    def websocket_connect(self, url, *args, **kwargs):
+        with super().websocket_connect(url, *args, **kwargs) as ws:
+            ws.send_json({"type": "auth", "pass": self.token})
+            yield ws
+
+    def bare_socket(self, url, **kwargs):
+        """A socket that sends no pass."""
+        return TestClient.websocket_connect(self, url, **kwargs)
+
+
+def _pass() -> str:
+    return access.issue_pass("alpha-code")[0]
+
+
 @pytest.fixture
-def client(world) -> TestClient:
+def client(world) -> PassClient:
+    with PassClient(main.app, _pass()) as c:
+        yield c
+
+
+@pytest.fixture
+def anon(world) -> TestClient:
     with TestClient(main.app) as c:
         yield c
 
@@ -399,7 +437,7 @@ def test_rest_errors_hide_the_details(world, monkeypatch) -> None:
         raise RuntimeError("secret-boom at /srv/app.py")
 
     monkeypatch.setattr(store, "create", broken)
-    with TestClient(main.app, raise_server_exceptions=False) as client:
+    with PassClient(main.app, _pass(), raise_server_exceptions=False) as client:
         response = client.post("/cases", json={"mode": "watch"})
     assert response.status_code == 500
     assert response.json() == {"code": "server_error", "message": main.SERVER_ERROR_MESSAGE}
@@ -1401,3 +1439,191 @@ def test_a_clinic_case_does_not_open_with_start(client, world) -> None:
         msg = ws.receive_json()
     assert msg["type"] == "error" and msg["code"] == "bad_message"
     assert world.runs == 0
+
+
+# ---------- the access gate ----------
+
+
+def _post_cases(client: TestClient, **kwargs):
+    return client.post("/cases", json={"mode": "watch"}, **kwargs)
+
+
+def _cases_created(monkeypatch) -> list:
+    created: list = []
+    real = store.create
+    monkeypatch.setattr(store, "create", lambda *a, **k: created.append(a) or real(*a, **k))
+    return created
+
+
+def _no_model_or_voice_calls(world) -> None:
+    assert world.runs == 0
+    assert world.spoken == []  # no ElevenLabs
+    assert world.heard == [] and world.classified == []  # no Meta LLM
+    assert world.stt_opened == 0  # no Meta STT
+
+
+def test_the_right_code_returns_a_pass(anon) -> None:
+    before = time.time()
+    response = anon.post("/access", json={"code": "alpha-code"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["expires_at"] == pytest.approx(before + 12 * 3600, abs=60)
+    assert access.verify_pass(body["pass"])
+    assert _post_cases(anon, headers={"Authorization": f"Bearer {body['pass']}"}).status_code == 200
+
+
+def test_codes_ignore_case_and_spaces(anon) -> None:
+    for code in ("ALPHA-CODE", "  alpha-code\n", "beta-code", "BETA-CODE"):
+        assert anon.post("/access", json={"code": code}).status_code == 200, code
+
+
+def test_a_wrong_code_is_401_and_never_logged(anon, caplog) -> None:
+    with caplog.at_level(logging.INFO):
+        response = anon.post("/access", json={"code": "hunter2-guess"})
+    assert response.status_code == 401
+    assert response.json()["message"] == "That code didn't work."
+    assert "wrong code" in caplog.text  # the attempt is logged
+    assert "hunter2-guess" not in caplog.text and "alpha-code" not in caplog.text
+
+
+def test_the_sixth_wrong_try_in_ten_minutes_is_429(anon) -> None:
+    for _ in range(5):
+        assert anon.post("/access", json={"code": "nope"}).status_code == 401
+    response = anon.post("/access", json={"code": "nope"})
+    assert response.status_code == 429
+    assert response.json()["message"] == "Too many tries. Try again in a few minutes."
+    # Locked out means locked out: the right code waits too. Another visitor is unaffected.
+    assert anon.post("/access", json={"code": "alpha-code"}).status_code == 429
+    other = {"X-Forwarded-For": "9.9.9.9"}
+    assert anon.post("/access", json={"code": "alpha-code"}, headers=other).status_code == 200
+
+
+def test_the_wrong_code_lockout_lifts_after_ten_minutes(monkeypatch) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(guard, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    guard.reset()
+    for _ in range(5):
+        assert guard.code_tries_left("1.1.1.1")
+        guard.note_wrong_code("1.1.1.1")
+    assert not guard.code_tries_left("1.1.1.1")
+    now[0] += guard.CODE_WINDOW_S + 1
+    assert guard.code_tries_left("1.1.1.1")
+    guard.reset()
+
+
+def test_cases_need_a_pass(anon, world, monkeypatch) -> None:
+    created = _cases_created(monkeypatch)
+    for headers in ({}, {"Authorization": "Bearer "}, {"Authorization": "Bearer junk"}, {"Authorization": "Basic abc"}):
+        response = _post_cases(anon, headers=headers)
+        assert response.status_code == 401, headers
+        assert response.json()["code"] == "access_required"
+    assert created == []  # no case was created
+    _no_model_or_voice_calls(world)
+
+
+def test_expired_and_tampered_passes_are_rejected(anon, monkeypatch) -> None:
+    created = _cases_created(monkeypatch)
+    valid = _pass()
+    expired = access.issue_pass("alpha-code", now=time.time() - 12 * 3600 - 5)[0]
+    payload, signature = valid.split(".")
+    longer = access._b64(json.dumps({"exp": time.time() + 10**9, "c": "x"}).encode())
+    flipped = valid[:-2] + ("AA" if valid[-2:] != "AA" else "BB")
+    for bad in (expired, f"{longer}.{signature}", flipped, payload, "." + signature, f"{payload}."):
+        assert _post_cases(anon, headers={"Authorization": f"Bearer {bad}"}).status_code == 401, bad
+    # A pass signed with some other secret is not ours.
+    monkeypatch.setattr(get_settings(), "access_token_secret", SecretStr("another-secret"))
+    assert _post_cases(anon, headers={"Authorization": f"Bearer {valid}"}).status_code == 401
+    assert created == []
+
+
+def test_removing_a_code_ends_its_passes(anon, monkeypatch) -> None:
+    alpha, beta = access.issue_pass("alpha-code")[0], access.issue_pass("beta-code")[0]
+    monkeypatch.setattr(get_settings(), "access_codes", SecretStr("beta-code"))
+    assert _post_cases(anon, headers={"Authorization": f"Bearer {alpha}"}).status_code == 401
+    assert _post_cases(anon, headers={"Authorization": f"Bearer {beta}"}).status_code == 200
+
+
+def test_the_socket_needs_a_pass(client, world) -> None:
+    case_id = _new_case(client)
+    with client.bare_socket(f"/ws/case/{case_id}") as ws:
+        ws.send_json({"type": "start"})  # not a pass
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+    assert closed.value.code == 4401
+    _no_model_or_voice_calls(world)
+
+
+def test_the_socket_refuses_a_bad_or_expired_pass_before_any_work(client, world) -> None:
+    expired = access.issue_pass("alpha-code", now=time.time() - 13 * 3600)[0]
+    for token in ("junk", expired):
+        case_id = _new_case(client, mode="patient")
+        with client.bare_socket(f"/ws/case/{case_id}") as ws:
+            ws.send_json({"type": "auth", "pass": token})
+            ws.send_json({"type": "listen"})
+            with pytest.raises(WebSocketDisconnect) as closed:
+                ws.receive_json()
+        assert closed.value.code == 4401
+    _no_model_or_voice_calls(world)
+
+
+def test_a_silent_socket_is_closed_with_4401(client, world, monkeypatch) -> None:
+    monkeypatch.setattr(main, "AUTH_WAIT_S", 0.2)
+    case_id = _new_case(client)
+    with client.bare_socket(f"/ws/case/{case_id}") as ws:
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+    assert closed.value.code == 4401
+
+
+def test_the_socket_checks_the_pass_before_looking_up_the_case(client) -> None:
+    with client.bare_socket("/ws/case/nope") as ws:
+        ws.send_json({"type": "start"})
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()  # 4401, not "no such case"
+    assert closed.value.code == 4401
+
+
+def test_a_valid_pass_opens_the_socket(client) -> None:
+    assert _run(client)[-1]["status"] == "offers_ready"
+
+
+def test_an_empty_access_codes_turns_the_gate_off(anon, world, monkeypatch) -> None:
+    monkeypatch.setattr(get_settings(), "access_codes", SecretStr(""))
+    assert anon.get("/config/access").json() == {"required": False}
+    case_id = _post_cases(anon).json()["case_id"]  # no pass
+    with anon.websocket_connect(f"/ws/case/{case_id}") as ws:  # no pass
+        ws.send_json({"type": "start"})
+        assert _until_done(ws)[-1]["status"] == "offers_ready"
+        ws.send_json({"type": "auth", "pass": "left over from an earlier visit"})  # ignored, no error
+        ws.send_json({"type": "dance"})
+        errors = _until(ws, lambda m: m["type"] == "error")  # the first error is the bad message, not the pass
+        assert errors[-1]["code"] == "bad_message"
+    assert anon.post("/access", json={"code": "anything"}).status_code == 404
+
+
+def test_codes_without_a_secret_let_nobody_in(anon, monkeypatch) -> None:
+    token = _pass()
+    monkeypatch.setattr(get_settings(), "access_token_secret", SecretStr(""))
+    assert anon.post("/access", json={"code": "alpha-code"}).status_code == 503
+    assert _post_cases(anon, headers={"Authorization": f"Bearer {token}"}).status_code == 401
+
+
+def test_health_and_the_judge_sheet_stay_open(anon) -> None:
+    assert anon.get("/health").status_code == 200
+    assert anon.get("/config/judge-sheet").status_code == 200
+    assert anon.get("/config/access").json() == {"required": True}
+
+
+def test_the_browser_may_send_the_authorization_header() -> None:
+    origin = get_settings().web_origins[0]
+    with TestClient(main.app) as c:
+        response = c.options(
+            "/cases",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type",
+            },
+        )
+    assert response.status_code == 200
+    assert "authorization" in response.headers["access-control-allow-headers"].lower()

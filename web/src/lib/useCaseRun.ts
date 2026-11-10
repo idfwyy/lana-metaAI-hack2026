@@ -121,6 +121,8 @@ export function useCaseRun(
   onClinic?: () => void,
   /** The Sound toggle: the single source of truth. A change applies to the run in progress at once. */
   sound = true,
+  /** The server turned the pass down (socket close 4401): the app clears it and asks for a code. */
+  onAccessDenied?: () => void,
 ): {
   state: RunState;
   listen: ListenState;
@@ -150,6 +152,8 @@ export function useCaseRun(
   startOver.current = onStartOver;
   const clinicStart = useRef(onClinic);
   clinicStart.current = onClinic;
+  const accessDenied = useRef(onAccessDenied);
+  accessDenied.current = onAccessDenied;
   const soundOn = useRef(sound);
   soundOn.current = sound;
   /** The server voices this case's lines: it started with sound, or need_audio was sent. */
@@ -252,6 +256,7 @@ export function useCaseRun(
               toast("Connection dropped. Lana is starting the calls again.");
             }
           },
+          onUnauthorized: () => accessDenied.current?.(),
           onFatal: (message) =>
             dispatch({
               kind: "event",

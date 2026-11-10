@@ -285,6 +285,8 @@ export function isLine(m: ServerMessage): m is LineEvent {
 }
 
 export type ClientMessage =
+  /** The access pass: the first message on the socket, when there is one. */
+  | { type: "auth"; pass: string }
   | { type: "start" }
   | { type: "listen" }
   | { type: "stop" }

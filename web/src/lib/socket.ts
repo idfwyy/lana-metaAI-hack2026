@@ -1,9 +1,11 @@
 // The case WebSocket: opens with start (Watch) or listen (the patient's voice intake), sends
 // stop, text and binary mic frames, and hands every message to onMessage.
+// The pass goes first, as an auth message (a query string would end up in server logs). Close
+// code 4401 means the server turned it down: no reconnect, the caller asks for a code again.
 // An unexpected close reconnects once (the server cancels the run when a socket drops,
 // so the caller resets and the run starts over). A second close is fatal.
 
-import { API_URL } from "./api";
+import { API_URL, getPass } from "./api";
 import type { ClientMessage, ServerMessage } from "./types";
 
 // Blank VITE_WS_URL: the same host as VITE_API_URL (https -> wss, http -> ws).
@@ -17,7 +19,12 @@ export interface CaseSocketHandlers {
   /** Called before the run restarts on a reconnect. */
   onRestart: () => void;
   onFatal: (message: string) => void;
+  /** The server closed with 4401: the pass is missing, expired or no longer valid. */
+  onUnauthorized: () => void;
 }
+
+/** The close code the server uses for a missing, expired or revoked pass. */
+export const CLOSE_UNAUTHORIZED = 4401;
 
 export class CaseSocket {
   private ws: WebSocket | null = null;
@@ -42,6 +49,8 @@ export class CaseSocket {
     this.ws = ws;
     ws.onopen = () => {
       opened = true;
+      const pass = getPass();
+      if (pass) this.send({ type: "auth", pass });
       this.send(this.opening);
     };
     ws.onmessage = (e) => {
@@ -54,9 +63,12 @@ export class CaseSocket {
       }
       this.handlers.onMessage(msg);
     };
-    ws.onclose = () => {
+    ws.onclose = (e) => {
       if (this.ws !== ws || this.closedByUs || this.finished) return;
-      if (!opened) {
+      if (e.code === CLOSE_UNAUTHORIZED) {
+        this.finished = true;
+        this.handlers.onUnauthorized();
+      } else if (!opened) {
         // Never connected: retrying the run won't help.
         this.handlers.onFatal("Can't reach Lana's server. Try again in a moment.");
       } else if (!this.reconnected) {
